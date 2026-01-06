@@ -1,0 +1,1366 @@
+//+------------------------------------------------------------------+
+//|                          Auric Edge ICT-SMC Pure v5.0            |
+//|                    Pure Institutional Execution Engine            |
+//|                          NO INDICATORS - PURE PRICE ACTION        |
+//+------------------------------------------------------------------+
+#property copyright "Auric Capital - ICT/SMC Edition"
+#property version   "5.00"
+#property strict
+
+//==================================================================
+// ENUMERATIONS
+//==================================================================
+enum TREND_STATE
+{
+   TREND_BULLISH,
+   TREND_BEARISH,
+   TREND_NEUTRAL
+};
+
+enum LIQUIDITY_TYPE
+{
+   LIQ_NONE,
+   LIQ_BUYSIDE,
+   LIQ_SELLSIDE
+};
+
+//==================================================================
+// INPUT PARAMETERS
+//==================================================================
+input group "=== RISK MANAGEMENT ==="
+input double        Risk_Per_Trade     = 1.0;    // Risk % per trade
+input int           Max_Trades         = 1;      // Max concurrent trades
+input double        Max_Daily_Loss     = 3.0;    // Max daily loss %
+input bool          Use_Runner         = true;   // Use profit runner
+
+input group "=== ICT SETTINGS ==="
+input int           Structure_Lookback = 50;     // Structure lookback bars
+input double        EQ_Tolerance       = 0.0003; // Equal high/low tolerance
+input int           Min_Swing_Bars     = 2;      // Min bars for valid swing
+input double        Displacement_Body  = 0.60;   // Min body % for impulse
+input double        FVG_Min_Size       = 0.0001; // Min FVG size
+
+input group "=== TIME FILTERS ==="
+input bool          Use_Kill_Zones     = true;   // Enable kill zones only
+input int           London_Start       = 2;      // London start (server time)
+input int           London_End         = 5;      // London end
+input int           NY_Start           = 8;      // NY start (server time)
+input int           NY_End             = 11;     // NY end
+
+input group "=== EXECUTION ==="
+input int           Max_Spread_Points  = 30;     // Max spread points
+input int           Slippage           = 10;     // Slippage points
+input ulong         Magic_Number       = 100777; // Magic number
+input bool          Debug_Mode         = true;   // Debug logging
+
+//==================================================================
+// STRUCTURE CLASSES
+//==================================================================
+struct SwingPoint
+{
+   datetime time;
+   double price;
+   int bar_index;
+   bool is_high;
+   bool valid;
+};
+
+struct LiquidityPool
+{
+   datetime time;
+   double price;
+   LIQUIDITY_TYPE type;
+   bool swept;
+   bool active;
+   int id;
+};
+
+struct FairValueGap
+{
+   datetime time;
+   double high;
+   double low;
+   bool bullish;
+   bool mitigated;
+   bool active;
+   int creation_bar;
+};
+
+struct OrderBlock
+{
+   datetime time;
+   double high;
+   double low;
+   bool bullish;
+   bool mitigated;
+   bool active;
+   int creation_bar;
+};
+
+struct DealingRange
+{
+   double high;
+   double low;
+   double eq;
+   datetime high_time;
+   datetime low_time;
+   bool valid;
+};
+
+//==================================================================
+// GLOBAL VARIABLES
+//==================================================================
+TREND_STATE current_trend = TREND_NEUTRAL;
+SwingPoint swing_highs[], swing_lows[];
+LiquidityPool liquidity_pools[];
+FairValueGap fvgs[];
+OrderBlock order_blocks[];
+DealingRange dealing_range;
+
+datetime last_bar_time = 0;
+datetime last_sweep_time = 0;
+int next_liq_id = 1;
+double daily_start_balance = 0;
+datetime daily_reset = 0;
+bool trade_executed_this_sweep = false;
+
+//==================================================================
+// INITIALIZATION
+//==================================================================
+int OnInit()
+{
+   ArrayResize(swing_highs, 0);
+   ArrayResize(swing_lows, 0);
+   ArrayResize(liquidity_pools, 0);
+   ArrayResize(fvgs, 0);
+   ArrayResize(order_blocks, 0);
+   
+   dealing_range.valid = false;
+   daily_start_balance = AccountInfoDouble(ACCOUNT_BALANCE);
+   daily_reset = TimeCurrent();
+   
+   Print("========================================");
+   Print("AURIC EDGE ICT-SMC PURE v5.0 INITIALIZED");
+   Print("Pure Price Action - No Indicators");
+   Print("Symbol: ", _Symbol);
+   Print("Timeframe: ", EnumToString(_Period));
+   Print("========================================");
+   
+   return INIT_SUCCEEDED;
+}
+
+//==================================================================
+// MAIN TICK HANDLER
+//==================================================================
+void OnTick()
+{
+   if(!IsNewBar()) return;
+   
+   // Reset daily tracking
+   CheckDailyReset();
+   
+   // Check kill zones
+   if(Use_Kill_Zones && !IsInKillZone())
+   {
+      if(Debug_Mode) Print("Outside kill zone");
+      return;
+   }
+   
+   // Check spread
+   if(GetSpreadPoints() > Max_Spread_Points)
+   {
+      if(Debug_Mode) Print("Spread too high: ", GetSpreadPoints());
+      return;
+   }
+   
+   // Check risk limits
+   if(!CheckRiskLimits())
+   {
+      Print("Risk limits breached - trading suspended");
+      return;
+   }
+   
+   // Check max trades
+   if(CountOpenTrades() >= Max_Trades)
+   {
+      if(Debug_Mode) Print("Max trades reached");
+      return;
+   }
+   
+   // ======= EXECUTION PIPELINE =======
+   
+   // 1. Update market structure
+   UpdateMarketStructure();
+   
+   // 2. Update liquidity pools
+   UpdateLiquidityPools();
+   
+   // 3. Check for liquidity sweeps
+   CheckLiquiditySweeps();
+   
+   // 4. Update dealing range (after confirmed BOS)
+   UpdateDealingRange();
+   
+   // 5. Detect displacement
+   bool displacement = DetectDisplacement();
+   
+   // 6. Update FVGs and OBs (only after displacement)
+   if(displacement)
+   {
+      UpdateFairValueGaps();
+      UpdateOrderBlocks();
+   }
+   
+   // 7. Check for trade setups
+   if(!trade_executed_this_sweep)
+   {
+      CheckForTradeSetup();
+   }
+   
+   // 8. Manage open positions
+   ManageOpenPositions();
+   
+   // Debug output
+   if(Debug_Mode && ITime(_Symbol, PERIOD_CURRENT, 0) % 300 == 0)
+      PrintMarketState();
+}
+
+//==================================================================
+// MARKET STRUCTURE ENGINE
+//==================================================================
+void UpdateMarketStructure()
+{
+   // Detect swing highs
+   for(int i = Min_Swing_Bars + 1; i < Structure_Lookback; i++)
+   {
+      if(IsSwingHigh(i))
+      {
+         if(!SwingExists(true, i))
+         {
+            AddSwingPoint(true, i);
+         }
+      }
+      
+      if(IsSwingLow(i))
+      {
+         if(!SwingExists(false, i))
+         {
+            AddSwingPoint(false, i);
+         }
+      }
+   }
+   
+   // Determine trend state based on BOS/CHoCH
+   UpdateTrendState();
+   
+   // Clean old swings
+   CleanOldSwings();
+}
+
+bool IsSwingHigh(int bar)
+{
+   double high = iHigh(_Symbol, PERIOD_CURRENT, bar);
+   
+   for(int i = 1; i <= Min_Swing_Bars; i++)
+   {
+      if(iHigh(_Symbol, PERIOD_CURRENT, bar - i) >= high) return false;
+      if(iHigh(_Symbol, PERIOD_CURRENT, bar + i) >= high) return false;
+   }
+   
+   return true;
+}
+
+bool IsSwingLow(int bar)
+{
+   double low = iLow(_Symbol, PERIOD_CURRENT, bar);
+   
+   for(int i = 1; i <= Min_Swing_Bars; i++)
+   {
+      if(iLow(_Symbol, PERIOD_CURRENT, bar - i) <= low) return false;
+      if(iLow(_Symbol, PERIOD_CURRENT, bar + i) <= low) return false;
+   }
+   
+   return true;
+}
+
+bool SwingExists(bool is_high, int bar)
+{
+   double price = is_high ? iHigh(_Symbol, PERIOD_CURRENT, bar) : 
+                            iLow(_Symbol, PERIOD_CURRENT, bar);
+   datetime time = iTime(_Symbol, PERIOD_CURRENT, bar);
+   
+   if(is_high)
+   {
+      for(int i = 0; i < ArraySize(swing_highs); i++)
+      {
+         if(swing_highs[i].time == time) return true;
+      }
+   }
+   else
+   {
+      for(int i = 0; i < ArraySize(swing_lows); i++)
+      {
+         if(swing_lows[i].time == time) return true;
+      }
+   }
+   
+   return false;
+}
+
+void AddSwingPoint(bool is_high, int bar)
+{
+   SwingPoint sp;
+   sp.time = iTime(_Symbol, PERIOD_CURRENT, bar);
+   sp.price = is_high ? iHigh(_Symbol, PERIOD_CURRENT, bar) : 
+                        iLow(_Symbol, PERIOD_CURRENT, bar);
+   sp.bar_index = bar;
+   sp.is_high = is_high;
+   sp.valid = true;
+   
+   if(is_high)
+   {
+      int size = ArraySize(swing_highs);
+      ArrayResize(swing_highs, size + 1);
+      swing_highs[size] = sp;
+   }
+   else
+   {
+      int size = ArraySize(swing_lows);
+      ArrayResize(swing_lows, size + 1);
+      swing_lows[size] = sp;
+   }
+   
+   if(Debug_Mode)
+      Print("Swing ", is_high ? "HIGH" : "LOW", " detected at ", sp.price);
+}
+
+void UpdateTrendState()
+{
+   // Check for BOS (Break of Structure) or CHoCH (Change of Character)
+   double current_close = iClose(_Symbol, PERIOD_CURRENT, 1);
+   
+   int high_count = ArraySize(swing_highs);
+   int low_count = ArraySize(swing_lows);
+   
+   if(high_count < 2 || low_count < 2)
+   {
+      current_trend = TREND_NEUTRAL;
+      return;
+   }
+   
+   // Get most recent swings
+   double last_high = swing_highs[high_count - 1].price;
+   double prev_high = swing_highs[high_count - 2].price;
+   double last_low = swing_lows[low_count - 1].price;
+   double prev_low = swing_lows[low_count - 2].price;
+   
+   // BOS Bullish: Close above previous swing high in uptrend
+   if(current_trend == TREND_BULLISH || current_trend == TREND_NEUTRAL)
+   {
+      if(current_close > last_high && last_high > prev_high)
+      {
+         if(current_trend != TREND_BULLISH)
+         {
+            current_trend = TREND_BULLISH;
+            if(Debug_Mode) Print("BOS BULLISH - Trend now BULLISH");
+         }
+      }
+   }
+   
+   // BOS Bearish: Close below previous swing low in downtrend
+   if(current_trend == TREND_BEARISH || current_trend == TREND_NEUTRAL)
+   {
+      if(current_close < last_low && last_low < prev_low)
+      {
+         if(current_trend != TREND_BEARISH)
+         {
+            current_trend = TREND_BEARISH;
+            if(Debug_Mode) Print("BOS BEARISH - Trend now BEARISH");
+         }
+      }
+   }
+   
+   // CHoCH: Close against current trend
+   if(current_trend == TREND_BULLISH && current_close < last_low)
+   {
+      current_trend = TREND_BEARISH;
+      if(Debug_Mode) Print("CHoCH - Trend changed to BEARISH");
+   }
+   
+   if(current_trend == TREND_BEARISH && current_close > last_high)
+   {
+      current_trend = TREND_BULLISH;
+      if(Debug_Mode) Print("CHoCH - Trend changed to BULLISH");
+   }
+}
+
+void CleanOldSwings()
+{
+   datetime cutoff = iTime(_Symbol, PERIOD_CURRENT, Structure_Lookback);
+   
+   for(int i = ArraySize(swing_highs) - 1; i >= 0; i--)
+   {
+      if(swing_highs[i].time < cutoff)
+      {
+         ArrayRemove(swing_highs, i, 1);
+      }
+   }
+   
+   for(int i = ArraySize(swing_lows) - 1; i >= 0; i--)
+   {
+      if(swing_lows[i].time < cutoff)
+      {
+         ArrayRemove(swing_lows, i, 1);
+      }
+   }
+}
+
+//==================================================================
+// LIQUIDITY POOL ENGINE
+//==================================================================
+void UpdateLiquidityPools()
+{
+   // Detect equal highs (buy-side liquidity)
+   DetectEqualHighs();
+   
+   // Detect equal lows (sell-side liquidity)
+   DetectEqualLows();
+   
+   // Clean old/invalid pools
+   CleanLiquidityPools();
+}
+
+void DetectEqualHighs()
+{
+   int high_count = ArraySize(swing_highs);
+   if(high_count < 2) return;
+   
+   for(int i = high_count - 1; i > 0; i--)
+   {
+      for(int j = i - 1; j >= 0 && j >= i - 5; j--)
+      {
+         double diff = MathAbs(swing_highs[i].price - swing_highs[j].price);
+         
+         if(diff <= EQ_Tolerance)
+         {
+            double avg_price = (swing_highs[i].price + swing_highs[j].price) / 2.0;
+            
+            if(!LiquidityPoolExists(avg_price, LIQ_BUYSIDE))
+            {
+               AddLiquidityPool(avg_price, LIQ_BUYSIDE, swing_highs[i].time);
+            }
+         }
+      }
+   }
+}
+
+void DetectEqualLows()
+{
+   int low_count = ArraySize(swing_lows);
+   if(low_count < 2) return;
+   
+   for(int i = low_count - 1; i > 0; i--)
+   {
+      for(int j = i - 1; j >= 0 && j >= i - 5; j--)
+      {
+         double diff = MathAbs(swing_lows[i].price - swing_lows[j].price);
+         
+         if(diff <= EQ_Tolerance)
+         {
+            double avg_price = (swing_lows[i].price + swing_lows[j].price) / 2.0;
+            
+            if(!LiquidityPoolExists(avg_price, LIQ_SELLSIDE))
+            {
+               AddLiquidityPool(avg_price, LIQ_SELLSIDE, swing_lows[i].time);
+            }
+         }
+      }
+   }
+}
+
+bool LiquidityPoolExists(double price, LIQUIDITY_TYPE type)
+{
+   for(int i = 0; i < ArraySize(liquidity_pools); i++)
+   {
+      if(liquidity_pools[i].active && 
+         liquidity_pools[i].type == type &&
+         MathAbs(liquidity_pools[i].price - price) < EQ_Tolerance)
+      {
+         return true;
+      }
+   }
+   return false;
+}
+
+void AddLiquidityPool(double price, LIQUIDITY_TYPE type, datetime time)
+{
+   LiquidityPool lp;
+   lp.time = time;
+   lp.price = price;
+   lp.type = type;
+   lp.swept = false;
+   lp.active = true;
+   lp.id = next_liq_id++;
+   
+   int size = ArraySize(liquidity_pools);
+   ArrayResize(liquidity_pools, size + 1);
+   liquidity_pools[size] = lp;
+   
+   if(Debug_Mode)
+      Print("Liquidity pool added: ", type == LIQ_BUYSIDE ? "BUY-SIDE" : "SELL-SIDE", 
+            " at ", DoubleToString(price, _Digits));
+}
+
+void CheckLiquiditySweeps()
+{
+   double current_high = iHigh(_Symbol, PERIOD_CURRENT, 1);
+   double current_low = iLow(_Symbol, PERIOD_CURRENT, 1);
+   datetime current_time = iTime(_Symbol, PERIOD_CURRENT, 1);
+   
+   for(int i = 0; i < ArraySize(liquidity_pools); i++)
+   {
+      if(!liquidity_pools[i].active || liquidity_pools[i].swept)
+         continue;
+      
+      bool swept = false;
+      
+      // Check buy-side sweep (wick touches equal highs)
+      if(liquidity_pools[i].type == LIQ_BUYSIDE)
+      {
+         if(current_high >= liquidity_pools[i].price)
+         {
+            swept = true;
+            liquidity_pools[i].swept = true;
+            last_sweep_time = current_time;
+            trade_executed_this_sweep = false;
+            
+            if(Debug_Mode)
+               Print("BUY-SIDE LIQUIDITY SWEPT at ", DoubleToString(liquidity_pools[i].price, _Digits));
+         }
+      }
+      
+      // Check sell-side sweep (wick touches equal lows)
+      if(liquidity_pools[i].type == LIQ_SELLSIDE)
+      {
+         if(current_low <= liquidity_pools[i].price)
+         {
+            swept = true;
+            liquidity_pools[i].swept = true;
+            last_sweep_time = current_time;
+            trade_executed_this_sweep = false;
+            
+            if(Debug_Mode)
+               Print("SELL-SIDE LIQUIDITY SWEPT at ", DoubleToString(liquidity_pools[i].price, _Digits));
+         }
+      }
+   }
+}
+
+void CleanLiquidityPools()
+{
+   datetime cutoff = iTime(_Symbol, PERIOD_CURRENT, 100);
+   
+   for(int i = ArraySize(liquidity_pools) - 1; i >= 0; i--)
+   {
+      if(liquidity_pools[i].time < cutoff || 
+         (liquidity_pools[i].swept && TimeCurrent() - last_sweep_time > 3600))
+      {
+         ArrayRemove(liquidity_pools, i, 1);
+      }
+   }
+}
+
+//==================================================================
+// DISPLACEMENT ENGINE
+//==================================================================
+bool DetectDisplacement()
+{
+   if(last_sweep_time == 0) return false;
+   
+   int bars_since_sweep = iBarShift(_Symbol, PERIOD_CURRENT, last_sweep_time);
+   if(bars_since_sweep < 0 || bars_since_sweep > 5) return false;
+   
+   // Check candles after sweep
+   for(int i = 1; i <= bars_since_sweep; i++)
+   {
+      double open = iOpen(_Symbol, PERIOD_CURRENT, i);
+      double close = iClose(_Symbol, PERIOD_CURRENT, i);
+      double high = iHigh(_Symbol, PERIOD_CURRENT, i);
+      double low = iLow(_Symbol, PERIOD_CURRENT, i);
+      
+      double body = MathAbs(close - open);
+      double range = high - low;
+      
+      if(range <= 0) continue;
+      
+      double body_pct = body / range;
+      
+      // Strong impulse candle
+      if(body_pct >= Displacement_Body)
+      {
+         if(Debug_Mode)
+            Print("DISPLACEMENT detected: Body=", DoubleToString(body_pct * 100, 1), "%");
+         return true;
+      }
+   }
+   
+   return false;
+}
+
+//==================================================================
+// DEALING RANGE ENGINE
+//==================================================================
+void UpdateDealingRange()
+{
+   int high_count = ArraySize(swing_highs);
+   int low_count = ArraySize(swing_lows);
+   
+   if(high_count < 1 || low_count < 1)
+   {
+      dealing_range.valid = false;
+      return;
+   }
+   
+   // Use most recent BOS highs/lows
+   dealing_range.high = swing_highs[high_count - 1].price;
+   dealing_range.low = swing_lows[low_count - 1].price;
+   dealing_range.eq = (dealing_range.high + dealing_range.low) / 2.0;
+   dealing_range.high_time = swing_highs[high_count - 1].time;
+   dealing_range.low_time = swing_lows[low_count - 1].time;
+   dealing_range.valid = true;
+}
+
+bool IsPremium(double price)
+{
+   if(!dealing_range.valid) return false;
+   return price > dealing_range.eq;
+}
+
+bool IsDiscount(double price)
+{
+   if(!dealing_range.valid) return false;
+   return price < dealing_range.eq;
+}
+
+//==================================================================
+// FAIR VALUE GAP ENGINE
+//==================================================================
+void UpdateFairValueGaps()
+{
+   // Only create FVGs after displacement
+   if(!DetectDisplacement()) return;
+   
+   for(int i = 3; i < 10; i++)
+   {
+      double high1 = iHigh(_Symbol, PERIOD_CURRENT, i);
+      double low1 = iLow(_Symbol, PERIOD_CURRENT, i);
+      double high2 = iHigh(_Symbol, PERIOD_CURRENT, i + 1);
+      double low2 = iLow(_Symbol, PERIOD_CURRENT, i + 1);
+      double high3 = iHigh(_Symbol, PERIOD_CURRENT, i + 2);
+      double low3 = iLow(_Symbol, PERIOD_CURRENT, i + 2);
+      
+      // Bullish FVG: gap between candle 3 high and candle 1 low
+      if(low1 > high3)
+      {
+         double gap_size = low1 - high3;
+         if(gap_size >= FVG_Min_Size && !FVGExists(high3, low1, true, i))
+         {
+            AddFVG(high3, low1, true, i);
+         }
+      }
+      
+      // Bearish FVG: gap between candle 3 low and candle 1 high
+      if(high1 < low3)
+      {
+         double gap_size = low3 - high1;
+         if(gap_size >= FVG_Min_Size && !FVGExists(high1, low3, false, i))
+         {
+            AddFVG(high1, low3, false, i);
+         }
+      }
+   }
+   
+   // Check for mitigation
+   CheckFVGMitigation();
+   CleanOldFVGs();
+}
+
+bool FVGExists(double high, double low, bool bullish, int bar)
+{
+   datetime time = iTime(_Symbol, PERIOD_CURRENT, bar);
+   
+   for(int i = 0; i < ArraySize(fvgs); i++)
+   {
+      if(fvgs[i].time == time && fvgs[i].bullish == bullish)
+         return true;
+   }
+   return false;
+}
+
+void AddFVG(double high, double low, bool bullish, int bar)
+{
+   FairValueGap fvg;
+   fvg.time = iTime(_Symbol, PERIOD_CURRENT, bar);
+   fvg.high = high;
+   fvg.low = low;
+   fvg.bullish = bullish;
+   fvg.mitigated = false;
+   fvg.active = true;
+   fvg.creation_bar = bar;
+   
+   int size = ArraySize(fvgs);
+   ArrayResize(fvgs, size + 1);
+   fvgs[size] = fvg;
+   
+   if(Debug_Mode)
+      Print("FVG created: ", bullish ? "BULLISH" : "BEARISH", 
+            " [", DoubleToString(low, _Digits), " - ", DoubleToString(high, _Digits), "]");
+}
+
+void CheckFVGMitigation()
+{
+   double current_close = iClose(_Symbol, PERIOD_CURRENT, 1);
+   
+   for(int i = 0; i < ArraySize(fvgs); i++)
+   {
+      if(!fvgs[i].active || fvgs[i].mitigated) continue;
+      
+      // Check if price has entered FVG
+      if(current_close >= fvgs[i].low && current_close <= fvgs[i].high)
+      {
+         fvgs[i].mitigated = true;
+         if(Debug_Mode) Print("FVG mitigated at ", DoubleToString(current_close, _Digits));
+      }
+   }
+}
+
+void CleanOldFVGs()
+{
+   for(int i = ArraySize(fvgs) - 1; i >= 0; i--)
+   {
+      if(fvgs[i].mitigated && (TimeCurrent() - fvgs[i].time) > 86400)
+      {
+         ArrayRemove(fvgs, i, 1);
+      }
+   }
+}
+
+//==================================================================
+// ORDER BLOCK ENGINE
+//==================================================================
+void UpdateOrderBlocks()
+{
+   if(!DetectDisplacement()) return;
+   
+   int bars_since_sweep = iBarShift(_Symbol, PERIOD_CURRENT, last_sweep_time);
+   if(bars_since_sweep < 2) return;
+   
+   // Find the last opposite candle before displacement
+   for(int i = bars_since_sweep + 1; i < bars_since_sweep + 5; i++)
+   {
+      double open = iOpen(_Symbol, PERIOD_CURRENT, i);
+      double close = iClose(_Symbol, PERIOD_CURRENT, i);
+      
+      bool is_bull_ob = (close < open); // Last bearish candle before bullish impulse
+      bool is_bear_ob = (close > open); // Last bullish candle before bearish impulse
+      
+      if((is_bull_ob && current_trend == TREND_BULLISH) ||
+         (is_bear_ob && current_trend == TREND_BEARISH))
+      {
+         if(!OBExists(i, is_bull_ob))
+         {
+            AddOrderBlock(i, is_bull_ob);
+            break;
+         }
+      }
+   }
+   
+   // Check OB mitigation
+   CheckOBMitigation();
+   CleanOldOBs();
+}
+
+bool OBExists(int bar, bool bullish)
+{
+   datetime time = iTime(_Symbol, PERIOD_CURRENT, bar);
+   
+   for(int i = 0; i < ArraySize(order_blocks); i++)
+   {
+      if(order_blocks[i].time == time && order_blocks[i].bullish == bullish)
+         return true;
+   }
+   return false;
+}
+
+void AddOrderBlock(int bar, bool bullish)
+{
+   OrderBlock ob;
+   ob.time = iTime(_Symbol, PERIOD_CURRENT, bar);
+   ob.high = iHigh(_Symbol, PERIOD_CURRENT, bar);
+   ob.low = iLow(_Symbol, PERIOD_CURRENT, bar);
+   ob.bullish = bullish;
+   ob.mitigated = false;
+   ob.active = true;
+   ob.creation_bar = bar;
+   
+   int size = ArraySize(order_blocks);
+   ArrayResize(order_blocks, size + 1);
+   order_blocks[size] = ob;
+   
+   if(Debug_Mode)
+      Print("Order Block created: ", bullish ? "BULLISH" : "BEARISH",
+            " [", DoubleToString(ob.low, _Digits), " - ", DoubleToString(ob.high, _Digits), "]");
+}
+
+void CheckOBMitigation()
+{
+   double current_close = iClose(_Symbol, PERIOD_CURRENT, 1);
+   
+   for(int i = 0; i < ArraySize(order_blocks); i++)
+   {
+      if(!order_blocks[i].active || order_blocks[i].mitigated) continue;
+      
+      if(current_close >= order_blocks[i].low && current_close <= order_blocks[i].high)
+      {
+         order_blocks[i].mitigated = true;
+         if(Debug_Mode) Print("Order Block mitigated");
+      }
+   }
+}
+
+void CleanOldOBs()
+{
+   for(int i = ArraySize(order_blocks) - 1; i >= 0; i--)
+   {
+      if(order_blocks[i].mitigated && (TimeCurrent() - order_blocks[i].time) > 86400)
+      {
+         ArrayRemove(order_blocks, i, 1);
+      }
+   }
+}
+
+//==================================================================
+// TRADE SETUP LOGIC
+//==================================================================
+void CheckForTradeSetup()
+{
+   if(current_trend == TREND_NEUTRAL)
+   {
+      if(Debug_Mode) Print("No trade: Trend is NEUTRAL");
+      return;
+   }
+   
+   if(last_sweep_time == 0)
+   {
+      if(Debug_Mode) Print("No trade: No liquidity sweep detected");
+      return;
+   }
+   
+   if(!DetectDisplacement())
+   {
+      if(Debug_Mode) Print("No trade: No displacement after sweep");
+      return;
+   }
+   
+   double current_price = (current_trend == TREND_BULLISH) ? 
+                          SymbolInfoDouble(_Symbol, SYMBOL_ASK) :
+                          SymbolInfoDouble(_Symbol, SYMBOL_BID);
+   
+   // Check dealing range position
+   if(current_trend == TREND_BULLISH && !IsDiscount(current_price))
+   {
+      if(Debug_Mode) Print("No trade: BUY not in discount zone");
+      return;
+   }
+   
+   if(current_trend == TREND_BEARISH && !IsPremium(current_price))
+   {
+      if(Debug_Mode) Print("No trade: SELL not in premium zone");
+      return;
+   }
+   
+   // Check for FVG or OB mitigation
+   bool entry_valid = false;
+   string entry_reason = "";
+   
+   // Check FVG mitigation
+   for(int i = 0; i < ArraySize(fvgs); i++)
+   {
+      if(fvgs[i].active && !fvgs[i].mitigated && 
+         fvgs[i].bullish == (current_trend == TREND_BULLISH))
+      {
+         if(current_price >= fvgs[i].low && current_price <= fvgs[i].high)
+         {
+            entry_valid = true;
+            entry_reason = "FVG Mitigation";
+            break;
+         }
+      }
+   }
+   
+   // Check OB mitigation
+   if(!entry_valid)
+   {
+      for(int i = 0; i < ArraySize(order_blocks); i++)
+      {
+         if(order_blocks[i].active && !order_blocks[i].mitigated &&
+            order_blocks[i].bullish == (current_trend == TREND_BULLISH))
+         {
+            if(current_price >= order_blocks[i].low && current_price <= order_blocks[i].high)
+            {
+               entry_valid = true;
+               entry_reason = "OB Mitigation";
+               break;
+            }
+         }
+      }
+   }
+   
+   if(!entry_valid)
+   {
+      if(Debug_Mode) Print("No trade: No FVG or OB mitigation");
+      return;
+   }
+   
+   // Execute trade
+   if(ExecuteInstitutionalTrade(entry_reason))
+   {
+      trade_executed_this_sweep = true;
+   }
+}
+
+//==================================================================
+// INSTITUTIONAL TRADE EXECUTION
+//==================================================================
+bool ExecuteInstitutionalTrade(string reason)
+{
+   double lot = CalculateLotSize();
+   if(lot <= 0) return false;
+   
+   ENUM_ORDER_TYPE type;
+   double price, sl, tp;
+   
+   if(current_trend == TREND_BULLISH)
+   {
+      type = ORDER_TYPE_BUY;
+      price = SymbolInfoDouble(_Symbol, SYMBOL_ASK);
+      
+      // SL below liquidity or OB low
+      sl = GetBuyStopLoss();
+      
+      // TP at next opposing liquidity
+      tp = GetBuyTakeProfit();
+   }
+   else
+   {
+      type = ORDER_TYPE_SELL;
+      price = SymbolInfoDouble(_Symbol, SYMBOL_BID);
+      
+      // SL above liquidity or OB high
+      sl = GetSellStopLoss();
+      
+      // TP at next opposing liquidity
+      tp = GetSellTakeProfit();
+   }
+   
+   if(!ValidateLevels(type, price, sl, tp))
+   {
+      Print("ERROR: Invalid order levels");
+      return false;
+   }
+   
+   return SendInstitutionalOrder(type, lot, price, sl, tp, reason);
+}
+
+double GetBuyStopLoss()
+{
+   double sl = 0;
+   
+   // Find nearest sell-side liquidity below price
+   double current_price = SymbolInfoDouble(_Symbol, SYMBOL_ASK);
+   
+   for(int i = 0; i < ArraySize(liquidity_pools); i++)
+   {
+      if(liquidity_pools[i].type == LIQ_SELLSIDE && 
+         liquidity_pools[i].swept &&
+         liquidity_pools[i].price < current_price)
+      {
+         if(sl == 0 || liquidity_pools[i].price > sl)
+            sl = liquidity_pools[i].price;
+      }
+   }
+   
+   // Fallback: use OB low
+   if(sl == 0)
+   {
+      for(int i = 0; i < ArraySize(order_blocks); i++)
+      {
+         if(order_blocks[i].bullish && order_blocks[i].active)
+         {
+            sl = order_blocks[i].low;
+            break;
+         }
+      }
+   }
+   
+   // Final fallback
+   if(sl == 0)
+      sl = current_price - 100 * _Point;
+   
+   return NormalizeDouble(sl - 10 * _Point, _Digits);
+}
+
+double GetSellStopLoss()
+{
+   double sl = 0;
+   
+   double current_price = SymbolInfoDouble(_Symbol, SYMBOL_BID);
+   
+   for(int i = 0; i < ArraySize(liquidity_pools); i++)
+   {
+      if(liquidity_pools[i].type == LIQ_BUYSIDE && 
+         liquidity_pools[i].swept &&
+         liquidity_pools[i].price > current_price)
+      {
+         if(sl == 0 || liquidity_pools[i].price < sl)
+            sl = liquidity_pools[i].price;
+      }
+   }
+   
+   if(sl == 0)
+   {
+      for(int i = 0; i < ArraySize(order_blocks); i++)
+      {
+         if(!order_blocks[i].bullish && order_blocks[i].active)
+         {
+            sl = order_blocks[i].high;
+            break;
+         }
+      }
+   }
+   
+   if(sl == 0)
+      sl = current_price + 100 * _Point;
+   
+   return NormalizeDouble(sl + 10 * _Point, _Digits);
+}
+
+double GetBuyTakeProfit()
+{
+   double current_price = SymbolInfoDouble(_Symbol, SYMBOL_ASK);
+   double tp = 0;
+   
+   // Find nearest buy-side liquidity above
+   for(int i = 0; i < ArraySize(liquidity_pools); i++)
+   {
+      if(liquidity_pools[i].type == LIQ_BUYSIDE &&
+         !liquidity_pools[i].swept &&
+         liquidity_pools[i].price > current_price)
+      {
+         if(tp == 0 || liquidity_pools[i].price < tp)
+            tp = liquidity_pools[i].price;
+      }
+   }
+   
+   if(tp == 0)
+      tp = current_price + 200 * _Point;
+   
+   return NormalizeDouble(tp, _Digits);
+}
+
+double GetSellTakeProfit()
+{
+   double current_price = SymbolInfoDouble(_Symbol, SYMBOL_BID);
+   double tp = 0;
+   
+   // Find nearest sell-side liquidity below
+   for(int i = 0; i < ArraySize(liquidity_pools); i++)
+   {
+      if(liquidity_pools[i].type == LIQ_SELLSIDE &&
+         !liquidity_pools[i].swept &&
+         liquidity_pools[i].price < current_price)
+      {
+         if(tp == 0 || liquidity_pools[i].price > tp)
+            tp = liquidity_pools[i].price;
+      }
+   }
+   
+   if(tp == 0)
+      tp = current_price - 200 * _Point;
+   
+   return NormalizeDouble(tp, _Digits);
+}
+
+bool SendInstitutionalOrder(ENUM_ORDER_TYPE type, double lot, double price, double sl, double tp, string reason)
+{
+   MqlTradeRequest req;
+   MqlTradeResult res;
+   ZeroMemory(req);
+   ZeroMemory(res);
+   
+   req.action = TRADE_ACTION_DEAL;
+   req.symbol = _Symbol;
+   req.volume = lot;
+   req.type = type;
+   req.price = price;
+   req.sl = sl;
+   req.tp = tp;
+   req.magic = Magic_Number;
+   req.deviation = Slippage;
+   req.type_filling = GetFillingMode();
+   req.comment = "ICT_" + reason;
+   
+   bool result = OrderSend(req, res);
+   
+   if(result && res.retcode == TRADE_RETCODE_DONE)
+   {
+      Print("========================================");
+      Print("TRADE EXECUTED: ", EnumToString(type));
+      Print("Reason: ", reason);
+      Print("Price: ", DoubleToString(price, _Digits));
+      Print("SL: ", DoubleToString(sl, _Digits));
+      Print("TP: ", DoubleToString(tp, _Digits));
+      Print("Lot: ", DoubleToString(lot, 2));
+      Print("========================================");
+      return true;
+   }
+   else
+   {
+      Print("ORDER FAILED: ", res.retcode, " - ", res.comment);
+      return false;
+   }
+}
+
+//==================================================================
+// POSITION MANAGEMENT
+//==================================================================
+void ManageOpenPositions()
+{
+   for(int i = PositionsTotal() - 1; i >= 0; i--)
+   {
+      ulong ticket = PositionGetTicket(i);
+      if(!PositionSelectByTicket(ticket)) continue;
+      
+      if(PositionGetInteger(POSITION_MAGIC) != Magic_Number) continue;
+      if(PositionGetString(POSITION_SYMBOL) != _Symbol) continue;
+      
+      // Move to breakeven after 50% move to TP
+      MoveToBreakeven(ticket);
+   }
+}
+
+void MoveToBreakeven(ulong ticket)
+{
+   if(!PositionSelectByTicket(ticket)) return;
+   
+   double open_price = PositionGetDouble(POSITION_PRICE_OPEN);
+   double sl = PositionGetDouble(POSITION_SL);
+   double tp = PositionGetDouble(POSITION_TP);
+   int type = (int)PositionGetInteger(POSITION_TYPE);
+   
+   double current = (type == POSITION_TYPE_BUY) ?
+                    SymbolInfoDouble(_Symbol, SYMBOL_BID) :
+                    SymbolInfoDouble(_Symbol, SYMBOL_ASK);
+   
+   if(tp == 0) return;
+   
+   double move = (type == POSITION_TYPE_BUY) ? current - open_price : open_price - current;
+   double target = MathAbs(tp - open_price);
+   
+   if(move >= target * 0.5)
+   {
+      double new_sl = NormalizeDouble(open_price + (type == POSITION_TYPE_BUY ? 10 : -10) * _Point, _Digits);
+      
+      if((type == POSITION_TYPE_BUY && new_sl > sl) ||
+         (type == POSITION_TYPE_SELL && (sl == 0 || new_sl < sl)))
+      {
+         ModifyPosition(ticket, new_sl, tp);
+         Print("Position moved to breakeven: ", ticket);
+      }
+   }
+}
+
+bool ModifyPosition(ulong ticket, double sl, double tp)
+{
+   MqlTradeRequest req;
+   MqlTradeResult res;
+   ZeroMemory(req);
+   ZeroMemory(res);
+   
+   req.action = TRADE_ACTION_SLTP;
+   req.position = ticket;
+   req.sl = sl;
+   req.tp = tp;
+   
+   return OrderSend(req, res);
+}
+
+//==================================================================
+// LOT SIZE CALCULATION
+//==================================================================
+double CalculateLotSize()
+{
+   double balance = AccountInfoDouble(ACCOUNT_BALANCE);
+   double risk_amount = balance * (Risk_Per_Trade / 100.0);
+   
+   // Calculate based on SL distance
+   double sl_distance = 0;
+   
+   if(current_trend == TREND_BULLISH)
+   {
+      double price = SymbolInfoDouble(_Symbol, SYMBOL_ASK);
+      double sl = GetBuyStopLoss();
+      sl_distance = price - sl;
+   }
+   else
+   {
+      double price = SymbolInfoDouble(_Symbol, SYMBOL_BID);
+      double sl = GetSellStopLoss();
+      sl_distance = sl - price;
+   }
+   
+   if(sl_distance <= 0) return 0;
+   
+   double tick_value = SymbolInfoDouble(_Symbol, SYMBOL_TRADE_TICK_VALUE);
+   double tick_size = SymbolInfoDouble(_Symbol, SYMBOL_TRADE_TICK_SIZE);
+   
+   double sl_points = sl_distance / _Point;
+   double lot = risk_amount / (sl_points * tick_value / tick_size);
+   
+   // Apply limits
+   double min_lot = SymbolInfoDouble(_Symbol, SYMBOL_VOLUME_MIN);
+   double max_lot = SymbolInfoDouble(_Symbol, SYMBOL_VOLUME_MAX);
+   double lot_step = SymbolInfoDouble(_Symbol, SYMBOL_VOLUME_STEP);
+   
+   lot = MathFloor(lot / lot_step) * lot_step;
+   lot = MathMax(min_lot, MathMin(lot, max_lot));
+   
+   return NormalizeDouble(lot, 2);
+}
+
+//==================================================================
+// UTILITY FUNCTIONS
+//==================================================================
+bool IsNewBar()
+{
+   datetime current_time = iTime(_Symbol, PERIOD_CURRENT, 0);
+   if(current_time != last_bar_time)
+   {
+      last_bar_time = current_time;
+      return true;
+   }
+   return false;
+}
+
+bool IsInKillZone()
+{
+   MqlDateTime dt;
+   TimeToStruct(TimeCurrent(), dt);
+   
+   // London Kill Zone
+   if(dt.hour >= London_Start && dt.hour < London_End)
+      return true;
+   
+   // NY Kill Zone
+   if(dt.hour >= NY_Start && dt.hour < NY_End)
+      return true;
+   
+   return false;
+}
+
+int GetSpreadPoints()
+{
+   return (int)((SymbolInfoDouble(_Symbol, SYMBOL_ASK) - 
+                 SymbolInfoDouble(_Symbol, SYMBOL_BID)) / _Point);
+}
+
+int CountOpenTrades()
+{
+   int count = 0;
+   for(int i = 0; i < PositionsTotal(); i++)
+   {
+      if(PositionGetSymbol(i) == _Symbol &&
+         PositionGetInteger(POSITION_MAGIC) == Magic_Number)
+         count++;
+   }
+   return count;
+}
+
+bool CheckRiskLimits()
+{
+   double balance = AccountInfoDouble(ACCOUNT_BALANCE);
+   double daily_loss = ((balance - daily_start_balance) / daily_start_balance) * 100.0;
+   
+   if(daily_loss < -Max_Daily_Loss)
+   {
+      Print("ALERT: Daily loss limit reached: ", DoubleToString(daily_loss, 2), "%");
+      return false;
+   }
+   
+   return true;
+}
+
+void CheckDailyReset()
+{
+   MqlDateTime dt;
+   TimeToStruct(TimeCurrent(), dt);
+   
+   if(dt.hour == 0 && TimeCurrent() > daily_reset + 3600)
+   {
+      daily_start_balance = AccountInfoDouble(ACCOUNT_BALANCE);
+      daily_reset = TimeCurrent();
+      Print("Daily statistics reset");
+   }
+}
+
+bool ValidateLevels(ENUM_ORDER_TYPE type, double price, double sl, double tp)
+{
+   double min_stop = SymbolInfoInteger(_Symbol, SYMBOL_TRADE_STOPS_LEVEL) * _Point;
+   
+   if(type == ORDER_TYPE_BUY)
+   {
+      if(price - sl < min_stop) return false;
+      if(tp > 0 && tp - price < min_stop) return false;
+   }
+   else
+   {
+      if(sl - price < min_stop) return false;
+      if(tp > 0 && price - tp < min_stop) return false;
+   }
+   
+   return true;
+}
+
+ENUM_ORDER_TYPE_FILLING GetFillingMode()
+{
+   int filling = (int)SymbolInfoInteger(_Symbol, SYMBOL_FILLING_MODE);
+   
+   if((filling & SYMBOL_FILLING_FOK) == SYMBOL_FILLING_FOK)
+      return ORDER_FILLING_FOK;
+   else if((filling & SYMBOL_FILLING_IOC) == SYMBOL_FILLING_IOC)
+      return ORDER_FILLING_IOC;
+   
+   return ORDER_FILLING_RETURN;
+}
+
+void PrintMarketState()
+{
+   Print("========================================");
+   Print("MARKET STATE");
+   Print("Trend: ", EnumToString(current_trend));
+   Print("Swing Highs: ", ArraySize(swing_highs));
+   Print("Swing Lows: ", ArraySize(swing_lows));
+   Print("Liquidity Pools: ", ArraySize(liquidity_pools));
+   Print("FVGs: ", ArraySize(fvgs));
+   Print("Order Blocks: ", ArraySize(order_blocks));
+   Print("Dealing Range: ", dealing_range.valid ? "Valid" : "Invalid");
+   if(dealing_range.valid)
+   {
+      Print("  High: ", DoubleToString(dealing_range.high, _Digits));
+      Print("  EQ: ", DoubleToString(dealing_range.eq, _Digits));
+      Print("  Low: ", DoubleToString(dealing_range.low, _Digits));
+   }
+   Print("========================================");
+}
+
+//+------------------------------------------------------------------+

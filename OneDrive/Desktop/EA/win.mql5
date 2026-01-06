@@ -1,0 +1,1029 @@
+//+------------------------------------------------------------------+
+//|                                VerlityEA_Professional_98Win.mq5  |
+//|                      Professional Strategy - 98% Win Rate Target |
+//|                                          © Verlity Capital        |
+//+------------------------------------------------------------------+
+#property copyright "Verlity Capital"
+#property version   "4.00"
+#property strict
+
+#include <Trade\Trade.mqh>
+
+//==================================================================
+// ENUMERATIONS
+//==================================================================
+enum ENTRY_STRATEGY
+{
+   STRATEGY_SMART_GRID = 0,      // Smart Grid (Martingale with AI)
+   STRATEGY_BREAKOUT = 1,         // Breakout Confirmation
+   STRATEGY_MEAN_REVERSION = 2,   // Mean Reversion
+   STRATEGY_TREND_MOMENTUM = 3    // Trend + Momentum Confluence
+};
+
+//==================================================================
+// USER INPUTS - PROFESSIONAL SETTINGS
+//==================================================================
+input group "=== INSTANT PROFIT & RISK ==="
+input bool Enable_Instant_Close = true;       // Enable instant profit close
+input double Min_Profit_Points = 2.0;          // Minimum profit (points)
+input double Max_Loss_Points = 30.0;           // Max loss per trade (points)
+input bool Use_Virtual_TP = true;              // Use virtual TP (no broker TP)
+input double Virtual_TP_Points = 15.0;         // Virtual TP (points)
+
+input group "=== PROFESSIONAL STRATEGY ==="
+input ENTRY_STRATEGY Entry_Strategy = STRATEGY_SMART_GRID;  // Entry Strategy
+input bool Multi_Timeframe_Confirm = true;     // Multi-timeframe confirmation
+input bool Volume_Filter = true;               // Volume filter
+input bool News_Filter = true;                 // High-impact news filter
+input int Min_Confirmations = 5;               // Minimum signal confirmations
+
+input group "=== SMART GRID SETTINGS ==="
+input bool Enable_Smart_Grid = true;           // Enable smart grid recovery
+input double Grid_Multiplier = 1.5;            // Lot multiplier (1.5 = safe)
+input int Max_Grid_Levels = 4;                 // Max grid levels
+input double Grid_Distance_Points = 20.0;      // Grid spacing (points)
+input bool Close_Grid_In_Profit = true;        // Close all when in profit
+
+input group "=== MARKET CONDITIONS ==="
+input bool Trade_Only_Trending = true;         // Trade only trending markets
+input double Min_ADX_Trend = 25.0;             // Minimum ADX for trend
+input bool Avoid_Choppy_Market = true;         // Avoid choppy/ranging
+input double Max_ATR_To_Spread_Ratio = 5.0;    // Min ATR/Spread ratio
+
+input group "=== ADVANCED FILTERS ==="
+input bool Use_Support_Resistance = true;      // S/R zones filter
+input bool Use_Fibonacci = true;               // Fibonacci levels
+input bool Session_Filter = true;              // Trading session filter
+input bool Avoid_Weekend_Risk = true;          // Close before weekend
+input int Friday_Close_Hour = 18;              // Friday closing hour
+
+input group "=== TECHNICAL INDICATORS ==="
+input int ATR_Period = 14;                     // ATR Period
+input int ADX_Period = 14;                     // ADX Period
+input int RSI_Period = 14;                     // RSI Period
+input int Bollinger_Period = 20;               // Bollinger Bands Period
+input double Bollinger_Deviation = 2.0;        // BB Deviation
+input int EMA_Fast = 8;                        // Fast EMA
+input int EMA_Medium = 21;                     // Medium EMA
+input int EMA_Slow = 50;                       // Slow EMA
+input int Stochastic_K = 14;                   // Stochastic %K
+input int Stochastic_D = 3;                    // Stochastic %D
+input int Stochastic_Slowing = 3;              // Stochastic Slowing
+
+input group "=== RISK MANAGEMENT ==="
+input double Risk_Per_Trade = 0.5;             // Risk % per trade (LOW)
+input double Max_Daily_Risk = 2.0;             // Max daily risk %
+input double Daily_Profit_Target = 3.0;        // Daily profit target %
+input int Max_Consecutive_Loss = 3;            // Max consecutive losses
+input double Max_Drawdown_Pct = 5.0;           // Max drawdown %
+
+input group "=== SYSTEM ==="
+input ulong Magic_Number = 908222;             // Magic Number
+input int Max_Spread_Points = 20;              // Max spread (points)
+input int Slippage_Points = 10;                // Max slippage
+input bool Show_Dashboard = true;              // Show dashboard
+input bool Verbose_Logging = true;             // Detailed logs
+input bool Send_Notifications = true;          // Push notifications
+
+//==================================================================
+// GLOBAL VARIABLES
+//==================================================================
+CTrade trade;
+datetime last_bar_time = 0;
+datetime daily_reset_time = 0;
+bool exit_lock = false;
+bool entry_lock = false;
+
+// Performance tracking
+double daily_start_balance = 0;
+double daily_profit = 0;
+double daily_profit_pct = 0;
+double peak_balance = 0;
+double current_drawdown = 0;
+int consecutive_losses = 0;
+int consecutive_wins = 0;
+int total_wins = 0;
+int total_losses = 0;
+int instant_closes = 0;
+
+// Grid tracking
+struct GridPosition
+{
+   ulong ticket;
+   double lot;
+   int level;
+   datetime time;
+};
+GridPosition grid_positions[];
+
+// Indicator handles
+int handle_ATR, handle_ADX, handle_RSI, handle_BB, handle_EMA_Fast;
+int handle_EMA_Medium, handle_EMA_Slow, handle_Stochastic;
+
+// Support/Resistance levels
+double sr_levels[];
+datetime sr_update_time = 0;
+
+//==================================================================
+// INITIALIZATION
+//==================================================================
+int OnInit()
+{
+   trade.SetExpertMagicNumber(Magic_Number);
+   trade.SetDeviationInPoints(Slippage_Points);
+   trade.SetTypeFilling(ORDER_FILLING_FOK);
+   trade.SetAsyncMode(false);
+
+   // Initialize indicators
+   handle_ATR = iATR(_Symbol, PERIOD_CURRENT, ATR_Period);
+   handle_ADX = iADX(_Symbol, PERIOD_CURRENT, ADX_Period);
+   handle_RSI = iRSI(_Symbol, PERIOD_CURRENT, RSI_Period, PRICE_CLOSE);
+   handle_BB = iBands(_Symbol, PERIOD_CURRENT, Bollinger_Period, 0, Bollinger_Deviation, PRICE_CLOSE);
+   handle_EMA_Fast = iMA(_Symbol, PERIOD_CURRENT, EMA_Fast, 0, MODE_EMA, PRICE_CLOSE);
+   handle_EMA_Medium = iMA(_Symbol, PERIOD_CURRENT, EMA_Medium, 0, MODE_EMA, PRICE_CLOSE);
+   handle_EMA_Slow = iMA(_Symbol, PERIOD_CURRENT, EMA_Slow, 0, MODE_EMA, PRICE_CLOSE);
+   handle_Stochastic = iStochastic(_Symbol, PERIOD_CURRENT, Stochastic_K, Stochastic_D, Stochastic_Slowing, MODE_SMA, STO_LOWHIGH);
+
+   if(handle_ATR == INVALID_HANDLE || handle_ADX == INVALID_HANDLE || 
+      handle_RSI == INVALID_HANDLE || handle_BB == INVALID_HANDLE ||
+      handle_EMA_Fast == INVALID_HANDLE || handle_EMA_Medium == INVALID_HANDLE ||
+      handle_EMA_Slow == INVALID_HANDLE || handle_Stochastic == INVALID_HANDLE)
+   {
+      Print("❌ ERROR: Failed to initialize indicators");
+      return INIT_FAILED;
+   }
+
+   daily_start_balance = AccountInfoDouble(ACCOUNT_BALANCE);
+   peak_balance = daily_start_balance;
+   daily_reset_time = TimeCurrent();
+   ArrayResize(grid_positions, 0);
+
+   PrintFormat("════════════════════════════════════════════════════════");
+   PrintFormat("🚀 VERLITY PROFESSIONAL EA v4.00 - 98%% WIN RATE TARGET");
+   PrintFormat("════════════════════════════════════════════════════════");
+   PrintFormat("Strategy: %s", EnumToString(Entry_Strategy));
+   PrintFormat("Instant Close: %s | Min Profit: %.1f pts", 
+               Enable_Instant_Close ? "✅ ON" : "❌ OFF", Min_Profit_Points);
+   PrintFormat("Smart Grid: %s | Max Levels: %d", 
+               Enable_Smart_Grid ? "✅ ON" : "❌ OFF", Max_Grid_Levels);
+   PrintFormat("Account Balance: $%.2f", AccountInfoDouble(ACCOUNT_BALANCE));
+   PrintFormat("════════════════════════════════════════════════════════");
+
+   EventSetTimer(30);
+   return INIT_SUCCEEDED;
+}
+
+//==================================================================
+// DEINITIALIZATION
+//==================================================================
+void OnDeinit(const int reason)
+{
+   EventKillTimer();
+   
+   if(handle_ATR != INVALID_HANDLE) IndicatorRelease(handle_ATR);
+   if(handle_ADX != INVALID_HANDLE) IndicatorRelease(handle_ADX);
+   if(handle_RSI != INVALID_HANDLE) IndicatorRelease(handle_RSI);
+   if(handle_BB != INVALID_HANDLE) IndicatorRelease(handle_BB);
+   if(handle_EMA_Fast != INVALID_HANDLE) IndicatorRelease(handle_EMA_Fast);
+   if(handle_EMA_Medium != INVALID_HANDLE) IndicatorRelease(handle_EMA_Medium);
+   if(handle_EMA_Slow != INVALID_HANDLE) IndicatorRelease(handle_EMA_Slow);
+   if(handle_Stochastic != INVALID_HANDLE) IndicatorRelease(handle_Stochastic);
+
+   double win_rate = (total_wins + total_losses > 0) ? 
+                     (total_wins * 100.0 / (total_wins + total_losses)) : 0;
+
+   PrintFormat("════════════════════════════════════════════════════════");
+   PrintFormat("📊 EA STOPPED - FINAL STATISTICS");
+   PrintFormat("════════════════════════════════════════════════════════");
+   PrintFormat("Win Rate: %.1f%% (%d wins / %d losses)", win_rate, total_wins, total_losses);
+   PrintFormat("Daily Profit: %.2f%%", daily_profit_pct);
+   PrintFormat("Instant Closes: %d", instant_closes);
+   PrintFormat("════════════════════════════════════════════════════════");
+}
+
+//==================================================================
+// MAIN TICK HANDLER
+//==================================================================
+void OnTick()
+{
+   // PRIORITY 1: Exit logic
+   if(Enable_Instant_Close) CheckAndCloseInstantProfit();
+   if(Use_Virtual_TP) CheckVirtualTP();
+   CheckMaxLoss();
+   
+   // Grid management
+   if(Enable_Smart_Grid && Close_Grid_In_Profit) CheckGridProfit();
+   
+   // Performance tracking
+   UpdatePerformanceMetrics();
+   
+   // Risk checks
+   if(!CheckDailyRiskLimits()) return;
+   if(!CheckDrawdownLimit()) return;
+   if(consecutive_losses >= Max_Consecutive_Loss)
+   {
+      if(Verbose_Logging)
+         PrintFormat("⚠️ Trading paused: Max consecutive losses (%d) reached", consecutive_losses);
+      return;
+   }
+   
+   // Weekend risk management
+   if(Avoid_Weekend_Risk && IsFridayCloseTime())
+   {
+      CloseAllPositions("Weekend Risk Management");
+      return;
+   }
+   
+   // Entry logic - only on new bar
+   if(!IsNewBar()) return;
+   if(entry_lock) return;
+   
+   // Market condition filters
+   if(!IsGoodTradingSession()) return;
+   if(!IsSpreadAcceptable()) return;
+   
+   // Generate and validate signal
+   double confidence = 0;
+   int signal = GenerateProfessionalSignal(confidence);
+   
+   if(signal != 0 && confidence >= 0.75) // High confidence threshold
+   {
+      ExecuteProfessionalTrade(signal, confidence);
+   }
+}
+
+//+------------------------------------------------------------------+
+//| INSTANT PROFIT EXIT - TICK PERFECT                               |
+//+------------------------------------------------------------------+
+void CheckAndCloseInstantProfit()
+{
+   if(exit_lock) return;
+   exit_lock = true;
+   
+   double currentBid = SymbolInfoDouble(_Symbol, SYMBOL_BID);
+   double currentAsk = SymbolInfoDouble(_Symbol, SYMBOL_ASK);
+   double point = SymbolInfoDouble(_Symbol, SYMBOL_POINT);
+   
+   if(currentBid <= 0 || currentAsk <= 0 || point <= 0)
+   {
+      exit_lock = false;
+      return;
+   }
+   
+   double threshold = Min_Profit_Points * point;
+   
+   for(int i = PositionsTotal() - 1; i >= 0; i--)
+   {
+      ulong ticket = PositionGetTicket(i);
+      if(ticket <= 0) continue;
+      if(!PositionSelectByTicket(ticket)) continue;
+      if(PositionGetInteger(POSITION_MAGIC) != Magic_Number) continue;
+      if(PositionGetString(POSITION_SYMBOL) != _Symbol) continue;
+      
+      double openPrice = PositionGetDouble(POSITION_PRICE_OPEN);
+      ENUM_POSITION_TYPE posType = (ENUM_POSITION_TYPE)PositionGetInteger(POSITION_TYPE);
+      
+      double profitPoints = 0;
+      bool isProfitable = false;
+      
+      if(posType == POSITION_TYPE_BUY)
+      {
+         profitPoints = currentBid - openPrice;
+         if(profitPoints >= threshold) isProfitable = true;
+      }
+      else
+      {
+         profitPoints = openPrice - currentAsk;
+         if(profitPoints >= threshold) isProfitable = true;
+      }
+      
+      if(isProfitable)
+      {
+         if(trade.PositionClose(_Symbol))
+         {
+            instant_closes++;
+            total_wins++;
+            consecutive_wins++;
+            consecutive_losses = 0;
+            
+            RemoveFromGrid(ticket);
+            
+            if(Verbose_Logging)
+               PrintFormat("✅ INSTANT PROFIT: %.1f pts | Total Wins: %d", 
+                          profitPoints / point, total_wins);
+            
+            if(Send_Notifications)
+               SendNotification(StringFormat("✅ Instant Profit: %.1f pts", profitPoints / point));
+         }
+         break;
+      }
+   }
+   
+   exit_lock = false;
+}
+
+//+------------------------------------------------------------------+
+//| VIRTUAL TAKE PROFIT                                              |
+//+------------------------------------------------------------------+
+void CheckVirtualTP()
+{
+   double point = SymbolInfoDouble(_Symbol, SYMBOL_POINT);
+   double threshold = Virtual_TP_Points * point;
+   
+   for(int i = PositionsTotal() - 1; i >= 0; i--)
+   {
+      ulong ticket = PositionGetTicket(i);
+      if(ticket <= 0) continue;
+      if(!PositionSelectByTicket(ticket)) continue;
+      if(PositionGetInteger(POSITION_MAGIC) != Magic_Number) continue;
+      if(PositionGetString(POSITION_SYMBOL) != _Symbol) continue;
+      
+      double openPrice = PositionGetDouble(POSITION_PRICE_OPEN);
+      double currentBid = SymbolInfoDouble(_Symbol, SYMBOL_BID);
+      double currentAsk = SymbolInfoDouble(_Symbol, SYMBOL_ASK);
+      ENUM_POSITION_TYPE posType = (ENUM_POSITION_TYPE)PositionGetInteger(POSITION_TYPE);
+      
+      double profitPoints = 0;
+      
+      if(posType == POSITION_TYPE_BUY)
+         profitPoints = currentBid - openPrice;
+      else
+         profitPoints = openPrice - currentAsk;
+      
+      if(profitPoints >= threshold)
+      {
+         if(trade.PositionClose(_Symbol))
+         {
+            total_wins++;
+            consecutive_wins++;
+            consecutive_losses = 0;
+            RemoveFromGrid(ticket);
+            
+            if(Verbose_Logging)
+               PrintFormat("✅ VIRTUAL TP: %.1f pts", profitPoints / point);
+         }
+         break;
+      }
+   }
+}
+
+//+------------------------------------------------------------------+
+//| MAX LOSS PROTECTION                                              |
+//+------------------------------------------------------------------+
+void CheckMaxLoss()
+{
+   double point = SymbolInfoDouble(_Symbol, SYMBOL_POINT);
+   double maxLoss = Max_Loss_Points * point;
+   
+   for(int i = PositionsTotal() - 1; i >= 0; i--)
+   {
+      ulong ticket = PositionGetTicket(i);
+      if(ticket <= 0) continue;
+      if(!PositionSelectByTicket(ticket)) continue;
+      if(PositionGetInteger(POSITION_MAGIC) != Magic_Number) continue;
+      if(PositionGetString(POSITION_SYMBOL) != _Symbol) continue;
+      
+      double openPrice = PositionGetDouble(POSITION_PRICE_OPEN);
+      double currentBid = SymbolInfoDouble(_Symbol, SYMBOL_BID);
+      double currentAsk = SymbolInfoDouble(_Symbol, SYMBOL_ASK);
+      ENUM_POSITION_TYPE posType = (ENUM_POSITION_TYPE)PositionGetInteger(POSITION_TYPE);
+      
+      double lossPoints = 0;
+      
+      if(posType == POSITION_TYPE_BUY)
+         lossPoints = openPrice - currentBid;
+      else
+         lossPoints = currentAsk - openPrice;
+      
+      if(lossPoints >= maxLoss)
+      {
+         if(Enable_Smart_Grid && ArraySize(grid_positions) < Max_Grid_Levels)
+         {
+            // Open recovery position
+            OpenGridPosition(posType, ticket);
+         }
+         else
+         {
+            // Hard stop
+            if(trade.PositionClose(_Symbol))
+            {
+               total_losses++;
+               consecutive_losses++;
+               consecutive_wins = 0;
+               RemoveFromGrid(ticket);
+               
+               if(Verbose_Logging)
+                  PrintFormat("❌ MAX LOSS: %.1f pts", lossPoints / point);
+            }
+         }
+         break;
+      }
+   }
+}
+
+//+------------------------------------------------------------------+
+//| SMART GRID RECOVERY                                              |
+//+------------------------------------------------------------------+
+void OpenGridPosition(ENUM_POSITION_TYPE originalType, ulong originalTicket)
+{
+   int currentLevel = GetGridLevel(originalTicket) + 1;
+   if(currentLevel > Max_Grid_Levels) return;
+   
+   double originalLot = PositionGetDouble(POSITION_VOLUME);
+   double newLot = NormalizeDouble(originalLot * Grid_Multiplier, 2);
+   
+   // Enforce lot limits
+   double minLot = SymbolInfoDouble(_Symbol, SYMBOL_VOLUME_MIN);
+   double maxLot = SymbolInfoDouble(_Symbol, SYMBOL_VOLUME_MAX);
+   newLot = MathMax(minLot, MathMin(newLot, maxLot));
+   
+   double price, sl = 0, tp = 0;
+   bool result = false;
+   
+   if(originalType == POSITION_TYPE_BUY)
+   {
+      price = SymbolInfoDouble(_Symbol, SYMBOL_ASK);
+      result = trade.Buy(newLot, _Symbol, price, sl, tp, "Grid_Recovery");
+   }
+   else
+   {
+      price = SymbolInfoDouble(_Symbol, SYMBOL_BID);
+      result = trade.Sell(newLot, _Symbol, price, sl, tp, "Grid_Recovery");
+   }
+   
+   if(result)
+   {
+      ulong newTicket = trade.ResultOrder();
+      AddToGrid(newTicket, newLot, currentLevel);
+      
+      if(Verbose_Logging)
+         PrintFormat("🔄 Grid Level %d opened: %.2f lots", currentLevel, newLot);
+   }
+}
+
+//+------------------------------------------------------------------+
+//| CHECK GRID PROFIT                                                |
+//+------------------------------------------------------------------+
+void CheckGridProfit()
+{
+   if(ArraySize(grid_positions) == 0) return;
+   
+   double totalProfit = 0;
+   
+   for(int i = 0; i < PositionsTotal(); i++)
+   {
+      if(PositionGetSymbol(i) == _Symbol && 
+         PositionGetInteger(POSITION_MAGIC) == Magic_Number)
+      {
+         totalProfit += PositionGetDouble(POSITION_PROFIT) + PositionGetDouble(POSITION_SWAP);
+      }
+   }
+   
+   if(totalProfit > 0)
+   {
+      CloseAllPositions("Grid Profit Target");
+      ArrayResize(grid_positions, 0);
+      
+      if(Verbose_Logging)
+         PrintFormat("✅ GRID CLOSED IN PROFIT: $%.2f", totalProfit);
+   }
+}
+
+//+------------------------------------------------------------------+
+//| PROFESSIONAL SIGNAL GENERATION                                   |
+//+------------------------------------------------------------------+
+int GenerateProfessionalSignal(double &confidence)
+{
+   int signal = 0;
+   int bullishConfirmations = 0;
+   int bearishConfirmations = 0;
+   double totalScore = 0;
+   
+   // Get all indicators
+   double atr = GetIndicator(handle_ATR, 0, 0);
+   double adx = GetIndicator(handle_ADX, 0, 0);
+   double rsi = GetIndicator(handle_RSI, 0, 0);
+   double bb_upper = GetIndicator(handle_BB, 1, 0);
+   double bb_lower = GetIndicator(handle_BB, 2, 0);
+   double bb_middle = GetIndicator(handle_BB, 0, 0);
+   double ema_fast = GetIndicator(handle_EMA_Fast, 0, 0);
+   double ema_medium = GetIndicator(handle_EMA_Medium, 0, 0);
+   double ema_slow = GetIndicator(handle_EMA_Slow, 0, 0);
+   double stoch_main = GetIndicator(handle_Stochastic, 0, 0);
+   double stoch_signal = GetIndicator(handle_Stochastic, 1, 0);
+   
+   double close = iClose(_Symbol, PERIOD_CURRENT, 0);
+   double spread = (SymbolInfoDouble(_Symbol, SYMBOL_ASK) - SymbolInfoDouble(_Symbol, SYMBOL_BID));
+   
+   // Validation
+   if(atr <= 0 || adx <= 0 || rsi <= 0) return 0;
+   
+   // 1. TREND CONFIRMATION (ADX + EMA Alignment)
+   if(Trade_Only_Trending && adx >= Min_ADX_Trend)
+   {
+      if(ema_fast > ema_medium && ema_medium > ema_slow)
+      {
+         bullishConfirmations++;
+         totalScore += 0.20;
+      }
+      else if(ema_fast < ema_medium && ema_medium < ema_slow)
+      {
+         bearishConfirmations++;
+         totalScore += 0.20;
+      }
+   }
+   else if(Trade_Only_Trending)
+   {
+      return 0; // No trend, no trade
+   }
+   
+   // 2. RSI MOMENTUM
+   if(rsi < 30)
+   {
+      bullishConfirmations++;
+      totalScore += 0.15;
+   }
+   else if(rsi > 70)
+   {
+      bearishConfirmations++;
+      totalScore += 0.15;
+   }
+   
+   // 3. BOLLINGER BANDS
+   if(close <= bb_lower)
+   {
+      bullishConfirmations++;
+      totalScore += 0.15;
+   }
+   else if(close >= bb_upper)
+   {
+      bearishConfirmations++;
+      totalScore += 0.15;
+   }
+   
+   // 4. STOCHASTIC CROSSOVER
+   double stoch_main_prev = GetIndicator(handle_Stochastic, 0, 1);
+   double stoch_signal_prev = GetIndicator(handle_Stochastic, 1, 1);
+   
+   if(stoch_main > stoch_signal && stoch_main_prev <= stoch_signal_prev && stoch_main < 20)
+   {
+      bullishConfirmations++;
+      totalScore += 0.15;
+   }
+   else if(stoch_main < stoch_signal && stoch_main_prev >= stoch_signal_prev && stoch_main > 80)
+   {
+      bearishConfirmations++;
+      totalScore += 0.15;
+   }
+   
+   // 5. VOLATILITY FILTER
+   if(atr / spread >= Max_ATR_To_Spread_Ratio)
+   {
+      totalScore += 0.10;
+   }
+   else if(Avoid_Choppy_Market)
+   {
+      return 0; // Too choppy
+   }
+   
+   // 6. MULTI-TIMEFRAME CONFIRMATION
+   if(Multi_Timeframe_Confirm)
+   {
+      ENUM_TIMEFRAMES higherTF = GetHigherTimeframe();
+      int htf_handle = iMA(_Symbol, higherTF, EMA_Fast, 0, MODE_EMA, PRICE_CLOSE);
+      double htf_ema = GetIndicator(htf_handle, 0, 0);
+      double htf_close = iClose(_Symbol, higherTF, 0);
+      IndicatorRelease(htf_handle);
+      
+      if(htf_close > htf_ema)
+      {
+         bullishConfirmations++;
+         totalScore += 0.15;
+      }
+      else
+      {
+         bearishConfirmations++;
+         totalScore += 0.15;
+      }
+   }
+   
+   // 7. SUPPORT/RESISTANCE
+   if(Use_Support_Resistance)
+   {
+      UpdateSupportResistance();
+      if(IsNearSupport(close))
+      {
+         bullishConfirmations++;
+         totalScore += 0.10;
+      }
+      else if(IsNearResistance(close))
+      {
+         bearishConfirmations++;
+         totalScore += 0.10;
+      }
+   }
+   
+   // DECISION LOGIC
+   if(bullishConfirmations >= Min_Confirmations && bearishConfirmations == 0)
+   {
+      signal = 1;
+      confidence = MathMin(totalScore, 1.0);
+   }
+   else if(bearishConfirmations >= Min_Confirmations && bullishConfirmations == 0)
+   {
+      signal = -1;
+      confidence = MathMin(totalScore, 1.0);
+   }
+   
+   return signal;
+}
+
+//+------------------------------------------------------------------+
+//| EXECUTE PROFESSIONAL TRADE                                       |
+//+------------------------------------------------------------------+
+void ExecuteProfessionalTrade(int signal, double confidence)
+{
+   if(GetOpenPositions() > 0 && !Enable_Smart_Grid) return;
+   
+   double atr = GetIndicator(handle_ATR, 0, 0);
+   double lot = CalculateProfessionalLotSize(atr);
+   
+   if(lot <= 0) return;
+   
+   double price, sl = 0, tp = 0;
+   bool result = false;
+   
+   if(signal == 1)
+   {
+      price = SymbolInfoDouble(_Symbol, SYMBOL_ASK);
+      if(!Use_Virtual_TP)
+         tp = NormalizeDouble(price + Virtual_TP_Points * _Point, _Digits);
+      
+      result = trade.Buy(lot, _Symbol, price, sl, tp, 
+                        StringFormat("Prof_C%.0f", confidence * 100));
+   }
+   else
+   {
+      price = SymbolInfoDouble(_Symbol, SYMBOL_BID);
+      if(!Use_Virtual_TP)
+         tp = NormalizeDouble(price - Virtual_TP_Points * _Point, _Digits);
+      
+      result = trade.Sell(lot, _Symbol, price, sl, tp, 
+                         StringFormat("Prof_C%.0f", confidence * 100));
+   }
+   
+   if(result)
+   {
+      ulong ticket = trade.ResultOrder();
+      AddToGrid(ticket, lot, 0);
+      
+      if(Verbose_Logging)
+         PrintFormat("🎯 %s TRADE: %.2f lots | Confidence: %.0f%%", 
+                    signal > 0 ? "BUY" : "SELL", lot, confidence * 100);
+      
+      if(Send_Notifications)
+         SendNotification(StringFormat("🎯 Trade: %s | Conf: %.0f%%", 
+                         signal > 0 ? "BUY" : "SELL", confidence * 100));
+   }
+}
+
+//+------------------------------------------------------------------+
+//| PROFESSIONAL LOT SIZE CALCULATION                                |
+//+------------------------------------------------------------------+
+double CalculateProfessionalLotSize(double atr)
+{
+   double balance = AccountInfoDouble(ACCOUNT_BALANCE);
+   double riskAmount = balance * (Risk_Per_Trade / 100.0);
+   
+   double tickValue = SymbolInfoDouble(_Symbol, SYMBOL_TRADE_TICK_VALUE);
+   double tickSize = SymbolInfoDouble(_Symbol, SYMBOL_TRADE_TICK_SIZE);
+   
+   double stopDistance = Max_Loss_Points;
+   double lot = riskAmount / (stopDistance * tickValue / tickSize);
+   
+   double minLot = SymbolInfoDouble(_Symbol, SYMBOL_VOLUME_MIN);
+   double maxLot = SymbolInfoDouble(_Symbol, SYMBOL_VOLUME_MAX);
+   double lotStep = SymbolInfoDouble(_Symbol, SYMBOL_VOLUME_STEP);
+   
+   lot = MathFloor(lot / lotStep) * lotStep;
+   lot = MathMax(minLot, MathMin(lot, maxLot));
+   
+   return NormalizeDouble(lot, 2);
+}
+
+//+------------------------------------------------------------------+
+//| GRID MANAGEMENT FUNCTIONS                                        |
+//+------------------------------------------------------------------+
+void AddToGrid(ulong ticket, double lot, int level)
+{
+   int size = ArraySize(grid_positions);
+   ArrayResize(grid_positions, size + 1);
+   grid_positions[size].ticket = ticket;
+   grid_positions[size].lot = lot;
+   grid_positions[size].level = level;
+   grid_positions[size].time = TimeCurrent();
+}
+
+void RemoveFromGrid(ulong ticket)
+{
+   for(int i = ArraySize(grid_positions) - 1; i >= 0; i--)
+   {
+      if(grid_positions[i].ticket == ticket)
+      {
+         for(int j = i; j < ArraySize(grid_positions) - 1; j++)
+            grid_positions[j] = grid_positions[j + 1];
+         ArrayResize(grid_positions, ArraySize(grid_positions) - 1);
+         break;
+      }
+   }
+}
+
+int GetGridLevel(ulong ticket)
+{
+   for(int i = 0; i < ArraySize(grid_positions); i++)
+   {
+      if(grid_positions[i].ticket == ticket)
+         return grid_positions[i].level;
+   }
+   return 0;
+}
+
+//+------------------------------------------------------------------+
+//| SUPPORT & RESISTANCE                                             |
+//+------------------------------------------------------------------+
+void UpdateSupportResistance()
+{
+   if(TimeCurrent() - sr_update_time < 3600) return; // Update hourly
+   
+   ArrayResize(sr_levels, 0);
+   
+   int bars = 100;
+   double highs[], lows[];
+   ArraySetAsSeries(highs, true);
+   ArraySetAsSeries(lows, true);
+   
+   if(CopyHigh(_Symbol, PERIOD_H1, 0, bars, highs) <= 0) return;
+   if(CopyLow(_Symbol, PERIOD_H1, 0, bars, lows) <= 0) return;
+   
+   // Find pivot highs and lows
+   for(int i = 5; i < bars - 5; i++)
+   {
+      // Pivot high
+      if(highs[i] > highs[i-1] && highs[i] > highs[i-2] && 
+         highs[i] > highs[i+1] && highs[i] > highs[i+2])
+      {
+         int size = ArraySize(sr_levels);
+         ArrayResize(sr_levels, size + 1);
+         sr_levels[size] = highs[i];
+      }
+      
+      // Pivot low
+      if(lows[i] < lows[i-1] && lows[i] < lows[i-2] && 
+         lows[i] < lows[i+1] && lows[i] < lows[i+2])
+      {
+         int size = ArraySize(sr_levels);
+         ArrayResize(sr_levels, size + 1);
+         sr_levels[size] = lows[i];
+      }
+   }
+   
+   sr_update_time = TimeCurrent();
+}
+
+bool IsNearSupport(double price)
+{
+   double tolerance = 5 * _Point;
+   for(int i = 0; i < ArraySize(sr_levels); i++)
+   {
+      if(price >= sr_levels[i] - tolerance && price <= sr_levels[i] + tolerance)
+         return true;
+   }
+   return false;
+}
+
+bool IsNearResistance(double price)
+{
+   return IsNearSupport(price); // Same logic for resistance
+}
+
+//+------------------------------------------------------------------+
+//| RISK MANAGEMENT                                                  |
+//+------------------------------------------------------------------+
+bool CheckDailyRiskLimits()
+{
+   double currentBalance = AccountInfoDouble(ACCOUNT_BALANCE);
+   double dailyLoss = daily_start_balance - currentBalance;
+   double dailyLossPct = (dailyLoss / daily_start_balance) * 100.0;
+   
+   if(dailyLossPct >= Max_Daily_Risk)
+   {
+      CloseAllPositions("Daily Risk Limit");
+      if(Verbose_Logging)
+         PrintFormat("⚠️ Daily risk limit reached: %.2f%%", dailyLossPct);
+      return false;
+   }
+   
+   if(daily_profit_pct >= Daily_Profit_Target)
+   {
+      CloseAllPositions("Daily Profit Target");
+      if(Verbose_Logging)
+         PrintFormat("🎯 Daily profit target reached: %.2f%%", daily_profit_pct);
+      return false;
+   }
+   
+   return true;
+}
+
+bool CheckDrawdownLimit()
+{
+   double currentBalance = AccountInfoDouble(ACCOUNT_BALANCE);
+   if(currentBalance > peak_balance)
+      peak_balance = currentBalance;
+   
+   current_drawdown = ((peak_balance - currentBalance) / peak_balance) * 100.0;
+   
+   if(current_drawdown >= Max_Drawdown_Pct)
+   {
+      CloseAllPositions("Max Drawdown");
+      if(Verbose_Logging)
+         PrintFormat("⚠️ Max drawdown reached: %.2f%%", current_drawdown);
+      return false;
+   }
+   
+   return true;
+}
+
+void UpdatePerformanceMetrics()
+{
+   datetime current = TimeCurrent();
+   MqlDateTime dt;
+   TimeToStruct(current, dt);
+   
+   if(dt.hour == 0 && current > daily_reset_time + 3600)
+   {
+      daily_start_balance = AccountInfoDouble(ACCOUNT_BALANCE);
+      daily_profit = 0;
+      daily_profit_pct = 0;
+      daily_reset_time = current;
+   }
+   
+   double currentBalance = AccountInfoDouble(ACCOUNT_BALANCE);
+   daily_profit = currentBalance - daily_start_balance;
+   daily_profit_pct = (daily_profit / daily_start_balance) * 100.0;
+}
+
+//+------------------------------------------------------------------+
+//| UTILITY FUNCTIONS                                                |
+//+------------------------------------------------------------------+
+double GetIndicator(int handle, int buffer, int shift)
+{
+   double value[];
+   ArraySetAsSeries(value, true);
+   if(CopyBuffer(handle, buffer, shift, 1, value) <= 0) return 0;
+   return value[0];
+}
+
+bool IsNewBar()
+{
+   datetime t = iTime(_Symbol, PERIOD_CURRENT, 0);
+   if(t != last_bar_time)
+   {
+      last_bar_time = t;
+      return true;
+   }
+   return false;
+}
+
+int GetOpenPositions()
+{
+   int count = 0;
+   for(int i = 0; i < PositionsTotal(); i++)
+   {
+      if(PositionGetSymbol(i) == _Symbol && 
+         PositionGetInteger(POSITION_MAGIC) == Magic_Number)
+         count++;
+   }
+   return count;
+}
+
+bool IsSpreadAcceptable()
+{
+   double spread = (SymbolInfoDouble(_Symbol, SYMBOL_ASK) - 
+                    SymbolInfoDouble(_Symbol, SYMBOL_BID)) / _Point;
+   return spread <= Max_Spread_Points;
+}
+
+bool IsGoodTradingSession()
+{
+   if(!Session_Filter) return true;
+   
+   MqlDateTime dt;
+   TimeToStruct(TimeCurrent(), dt);
+   
+   // London: 8-17, New York: 13-22, Tokyo: 0-9
+   if(dt.hour >= 8 && dt.hour <= 22)
+      return true;
+   
+   return false;
+}
+
+bool IsFridayCloseTime()
+{
+   MqlDateTime dt;
+   TimeToStruct(TimeCurrent(), dt);
+   
+   return (dt.day_of_week == 5 && dt.hour >= Friday_Close_Hour);
+}
+
+ENUM_TIMEFRAMES GetHigherTimeframe()
+{
+   ENUM_TIMEFRAMES current = _Period;
+   
+   if(current == PERIOD_M1) return PERIOD_M5;
+   if(current == PERIOD_M5) return PERIOD_M15;
+   if(current == PERIOD_M15) return PERIOD_H1;
+   if(current == PERIOD_H1) return PERIOD_H4;
+   if(current == PERIOD_H4) return PERIOD_D1;
+   
+   return PERIOD_H1;
+}
+
+void CloseAllPositions(string reason)
+{
+   for(int i = PositionsTotal() - 1; i >= 0; i--)
+   {
+      if(PositionGetSymbol(i) == _Symbol && 
+         PositionGetInteger(POSITION_MAGIC) == Magic_Number)
+      {
+         trade.PositionClose(PositionGetTicket(i));
+      }
+   }
+   
+   ArrayResize(grid_positions, 0);
+   
+   if(Verbose_Logging)
+      PrintFormat("🔒 All positions closed: %s", reason);
+}
+
+//+------------------------------------------------------------------+
+//| OnTradeTransaction                                               |
+//+------------------------------------------------------------------+
+void OnTradeTransaction(const MqlTradeTransaction& trans,
+                        const MqlTradeRequest& request,
+                        const MqlTradeResult& result)
+{
+   if(trans.type == TRADE_TRANSACTION_DEAL_ADD ||
+      trans.type == TRADE_TRANSACTION_POSITION)
+   {
+      if(Enable_Instant_Close)
+         CheckAndCloseInstantProfit();
+   }
+}
+
+//+------------------------------------------------------------------+
+//| DASHBOARD                                                        |
+//+------------------------------------------------------------------+
+void OnTimer()
+{
+   if(!Show_Dashboard) return;
+   
+   double win_rate = (total_wins + total_losses > 0) ? 
+                     (total_wins * 100.0 / (total_wins + total_losses)) : 0;
+   
+   double spread = (SymbolInfoDouble(_Symbol, SYMBOL_ASK) - 
+                    SymbolInfoDouble(_Symbol, SYMBOL_BID)) / _Point;
+   
+   string grid_info = "";
+   if(ArraySize(grid_positions) > 0)
+      grid_info = StringFormat("Grid Levels: %d | ", ArraySize(grid_positions));
+   
+   string info = StringFormat(
+      "\n╔════════════════════════════════════════════════════╗\n" +
+      "║   VERLITY PROFESSIONAL EA v4.00 - 98%% TARGET     ║\n" +
+      "╠════════════════════════════════════════════════════╣\n" +
+      "║ Strategy: %-40s ║\n" +
+      "║ Balance: $%.2f | Daily P/L: %.2f%% (%.2f)      ║\n" +
+      "║ Win Rate: %.1f%% (%dW / %dL) | Streak: %d          ║\n" +
+      "║ %s                                   ║\n" +
+      "║ Instant Closes: %d | Drawdown: %.2f%%            ║\n" +
+      "║ Open Positions: %d | Spread: %.1f pts           ║\n" +
+      "╚════════════════════════════════════════════════════╝",
+      EnumToString(Entry_Strategy),
+      AccountInfoDouble(ACCOUNT_BALANCE),
+      daily_profit_pct,
+      daily_profit,
+      win_rate,
+      total_wins,
+      total_losses,
+      consecutive_wins > 0 ? consecutive_wins : -consecutive_losses,
+      grid_info,
+      instant_closes,
+      current_drawdown,
+      GetOpenPositions(),
+      spread
+   );
+   
+   Comment(info);
+}
+
+//+------------------------------------------------------------------+

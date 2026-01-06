@@ -1,0 +1,1059 @@
+//+------------------------------------------------------------------+
+//|                   Auric Edge ICT-SMC Hybrid EA v4.0              |
+//|              Institutional Liquidity-Based Execution              |
+//|                        © Verlity Capital v4.0                     |
+//+------------------------------------------------------------------+
+#property copyright "Verlity Capital"
+#property version   "4.00"
+#property strict
+
+//==================================================================
+// ENUMERATIONS
+//==================================================================
+enum MARKET_BIAS { BIAS_BULLISH = 1, BIAS_BEARISH = -1, BIAS_NEUTRAL = 0 };
+enum LIQUIDITY_TYPE { LIQ_NONE = 0, LIQ_BUYSIDE = 1, LIQ_SELLSIDE = -1 };
+
+//==================================================================
+// STRUCTURES
+//==================================================================
+struct SwingPoint { datetime time; double price; int idx; bool is_high; };
+struct LiqPool { double price; bool is_buy; bool taken; int touches; };
+struct FVG { double top; double bot; bool bullish; bool hit; int idx; };
+struct OB { double h; double l; bool bullish; bool hit; int idx; };
+
+//==================================================================
+// INPUTS
+//==================================================================
+input group "=== RISK MANAGEMENT ==="
+input double Risk_Per_Trade = 0.5;
+input double Max_Daily_Loss = 2.5;
+input double Max_Lot_Size = 5.0;
+input int Max_Consecutive_Loss = 4;
+
+input group "=== ICT KILL ZONES (GMT) ==="
+input bool Use_London_KZ = true;
+input int London_Start = 7, London_End = 10;
+input bool Use_NY_KZ = true;
+input int NY_Start = 13, NY_End = 16;
+
+input group "=== MARKET STRUCTURE ==="
+input int Structure_Bars = 5;
+input int Structure_Lookback = 100;
+input double BOS_Threshold = 0.2;
+
+input group "=== LIQUIDITY ==="
+input double EQ_Tolerance = 50;
+input int Min_Pool_Touches = 2;
+input double Sweep_Wick_Ratio = 0.5;
+
+input group "=== ICT DEALING RANGE ==="
+input double Premium_Level = 0.62;
+input double Discount_Level = 0.38;
+
+input group "=== FVG & ORDER BLOCKS ==="
+input double Min_FVG_ATR = 0.3;
+input bool Use_Order_Blocks = true;
+input double OB_Body_Ratio = 0.5;
+
+input group "=== INDICATORS (CONFIRMATION ONLY) ==="
+input bool Use_EMA = true;
+input int EMA_Fast = 13, EMA_Slow = 50;
+input bool Use_RSI = true;
+input int RSI_Period = 14;
+input int RSI_Lower = 45, RSI_Upper = 65;
+input bool Use_Volume = true;
+input double Vol_Mult = 1.3;
+input int ATR_Period = 14;
+
+input group "=== EXECUTION ==="
+input double SL_ATR = 2.0, TP_ATR = 3.5;
+input double Partial_Close_Pct = 0.5;
+input bool Enable_Trailing = true;
+input double Trail_Start_R = 1.5;
+input double Trail_ATR_Mult = 0.5;
+
+input group "=== BROKER SETTINGS ==="
+input int Max_Slippage = 30;
+input double Max_Spread = 50;
+
+input group "=== SYSTEM ==="
+input ulong Magic = 908401;
+input bool Show_Panel = true;
+input bool Show_Objects = true;
+input bool Verbose = true;
+
+//==================================================================
+// GLOBALS
+//==================================================================
+datetime last_bar = 0, last_trade = 0, daily_reset = 0;
+int h_atr, h_ema_f, h_ema_s, h_rsi;
+double atr[], ema_f[], ema_s[], rsi[], c[], o[], h[], l[];
+long vol[];
+
+MARKET_BIAS bias = BIAS_NEUTRAL;
+LIQUIDITY_TYPE last_liq = LIQ_NONE;
+datetime last_liq_time = 0;
+
+SwingPoint sw_h[], sw_l[];
+LiqPool liq_pools[];
+FVG fvgs[];
+OB obs[];
+
+double range_h = 0, range_l = 0, range_eq = 0;
+double daily_pl = 0, daily_pct = 0, daily_start_bal = 0;
+int trades_today = 0, wins_today = 0, consec_loss = 0;
+bool trading_on = true;
+
+//==================================================================
+// INIT
+//==================================================================
+int OnInit()
+{
+   if(_Period != PERIOD_M1)
+   {
+      Alert("M1 timeframe required for ICT precision!");
+      return INIT_FAILED;
+   }
+   
+   h_atr = iATR(_Symbol, PERIOD_M1, ATR_Period);
+   if(Use_EMA)
+   {
+      h_ema_f = iMA(_Symbol, PERIOD_M1, EMA_Fast, 0, MODE_EMA, PRICE_CLOSE);
+      h_ema_s = iMA(_Symbol, PERIOD_M1, EMA_Slow, 0, MODE_EMA, PRICE_CLOSE);
+   }
+   if(Use_RSI)
+      h_rsi = iRSI(_Symbol, PERIOD_M1, RSI_Period, PRICE_CLOSE);
+   
+   if(h_atr == INVALID_HANDLE)
+   {
+      Print("❌ Failed to initialize ATR");
+      return INIT_FAILED;
+   }
+   
+   ArraySetAsSeries(atr, true);
+   ArraySetAsSeries(ema_f, true);
+   ArraySetAsSeries(ema_s, true);
+   ArraySetAsSeries(rsi, true);
+   ArraySetAsSeries(c, true);
+   ArraySetAsSeries(o, true);
+   ArraySetAsSeries(h, true);
+   ArraySetAsSeries(l, true);
+   ArraySetAsSeries(vol, true);
+   
+   daily_start_bal = AccountInfoDouble(ACCOUNT_BALANCE);
+   daily_reset = TimeCurrent();
+   
+   Print("╔════════════════════════════════════════════╗");
+   Print("║  AURIC EDGE ICT-SMC HYBRID v4.0           ║");
+   Print("║  🎯 LIQUIDITY-FIRST EXECUTION ENGINE      ║");
+   Print("╠════════════════════════════════════════════╣");
+   Print("║  Context: SMC + ICT + Liquidity           ║");
+   Print("║  Confirmation: Indicators (Secondary)     ║");
+   PrintFormat("║  Symbol: %s | Magic: %d", _Symbol, Magic);
+   Print("╚════════════════════════════════════════════╝");
+   
+   if(Show_Panel) EventSetTimer(5);
+   return INIT_SUCCEEDED;
+}
+
+//==================================================================
+// DEINIT
+//==================================================================
+void OnDeinit(const int reason)
+{
+   if(h_atr != INVALID_HANDLE) IndicatorRelease(h_atr);
+   if(h_ema_f != INVALID_HANDLE) IndicatorRelease(h_ema_f);
+   if(h_ema_s != INVALID_HANDLE) IndicatorRelease(h_ema_s);
+   if(h_rsi != INVALID_HANDLE) IndicatorRelease(h_rsi);
+   
+   if(Show_Objects) ObjectsDeleteAll(0, "ICT_");
+   if(Show_Panel) { EventKillTimer(); Comment(""); }
+   
+   double wr = (trades_today > 0) ? (wins_today * 100.0 / trades_today) : 0;
+   PrintFormat("═══ SESSION END: %d trades | %.1f%% WR | P/L: %.2f%% ═══", 
+               trades_today, wr, daily_pct);
+}
+
+//==================================================================
+// ONTICK - HIERARCHICAL PIPELINE
+//==================================================================
+void OnTick()
+{
+   CheckDailyReset();
+   
+   if(!trading_on) return;
+   if(!CheckRiskLimits()) return;
+   if(!IsNewBar()) return;
+   
+   // STEP 1: KILL ZONE
+   if(!InKillZone()) return;
+   
+   // STEP 2: UPDATE DATA
+   if(!UpdateData()) return;
+   if(atr[0] <= 0) return;
+   
+   // STEP 3: SPREAD CHECK
+   if(GetSpread() > Max_Spread)
+   {
+      if(Verbose) PrintFormat("❌ Spread: %.1f > %.1f", GetSpread(), Max_Spread);
+      return;
+   }
+   
+   // STEP 4: MARKET STRUCTURE
+   DetectStructure();
+   if(bias == BIAS_NEUTRAL)
+   {
+      if(Verbose) Print("❌ Step 3: No structure");
+      return;
+   }
+   
+   // STEP 5: LIQUIDITY SWEEP
+   DetectLiquidity();
+   LIQUIDITY_TYPE liq = CheckSweep();
+   if(liq == LIQ_NONE)
+   {
+      if(Verbose) Print("❌ Step 4: No liquidity sweep");
+      return;
+   }
+   
+   // STEP 6: DISPLACEMENT
+   if(!CheckDisplacement(liq))
+   {
+      if(Verbose) Print("❌ Step 5: No displacement");
+      return;
+   }
+   
+   // STEP 7: PREMIUM/DISCOUNT
+   UpdateRange();
+   int pd_sig = CheckPremDisc(liq);
+   if(pd_sig == 0)
+   {
+      if(Verbose) Print("❌ Step 6: Wrong zone");
+      return;
+   }
+   
+   // STEP 8: FVG/OB MITIGATION
+   DetectFVG();
+   if(Use_Order_Blocks) DetectOB();
+   
+   bool entry_ok = false;
+   string reason = "";
+   
+   if(CheckFVGEntry(pd_sig))
+   {
+      entry_ok = true;
+      reason = "FVG";
+   }
+   else if(Use_Order_Blocks && CheckOBEntry(pd_sig))
+   {
+      entry_ok = true;
+      reason = "OB";
+   }
+   
+   if(!entry_ok)
+   {
+      if(Verbose) Print("❌ Step 7: No FVG/OB");
+      return;
+   }
+   
+   // STEP 9: INDICATOR CONFIRMATION
+   if(!ConfirmIndicators(pd_sig))
+   {
+      if(Verbose) Print("❌ Step 8: Indicators not aligned");
+      return;
+   }
+   
+   // STEP 10: FINAL CHECKS
+   if(HasPosition())
+   {
+      if(Verbose) Print("❌ Step 9: Position exists");
+      return;
+   }
+   
+   if(last_liq_time > 0 && TimeCurrent() - last_liq_time < 300)
+   {
+      if(Verbose) Print("❌ Step 9: Already traded this sweep");
+      return;
+   }
+   
+   // STEP 11: EXECUTE
+   if(Verbose)
+   {
+      PrintFormat("✅ ALL STEPS PASSED");
+      PrintFormat("  Bias: %s | Liq: %s | Zone: %s | Entry: %s", 
+                  BiasStr(), LiqStr(liq), 
+                  pd_sig == 1 ? "DISCOUNT" : "PREMIUM", reason);
+      PrintFormat("🎯 EXECUTING %s", pd_sig == 1 ? "BUY" : "SELL");
+   }
+   
+   if(ExecuteTrade(pd_sig, liq, reason))
+   {
+      last_trade = TimeCurrent();
+      last_liq_time = TimeCurrent();
+      last_liq = liq;
+   }
+}
+
+//==================================================================
+// ONTIMER
+//==================================================================
+void OnTimer()
+{
+   if(!Show_Panel) return;
+   
+   string status = trading_on ? "🟢 ACTIVE" : "🔴 HALTED";
+   string session = InKillZone() ? "🟢 KILL ZONE" : "🔴 OFF-HOURS";
+   double wr = (trades_today > 0) ? (wins_today * 100.0 / trades_today) : 0;
+   
+   string info = StringFormat(
+      "\n╔════════════════════════════════════════╗\n"
+      "║  AURIC EDGE ICT-SMC v4.0               ║\n"
+      "╠════════════════════════════════════════╣\n"
+      "║ Status: %-30s ║\n"
+      "║ Session: %-29s ║\n"
+      "║ Structure: %-27s ║\n"
+      "╠════════════════════════════════════════╣\n"
+      "║ Daily P/L: %6.2f%% ($%9.2f)  ║\n"
+      "║ Trades: %3d | Win Rate: %5.1f%%      ║\n"
+      "║ Winners: %2d | Losers: %2d            ║\n"
+      "║ Consecutive Losses: %2d               ║\n"
+      "╠════════════════════════════════════════╣\n"
+      "║ Open Positions: %2d                   ║\n"
+      "║ Current Spread: %5.1f pts            ║\n"
+      "║ Balance: $%11.2f                ║\n"
+      "╚════════════════════════════════════════╝\n",
+      status, session, BiasStr(),
+      daily_pct, daily_pl,
+      trades_today, wr,
+      wins_today, trades_today - wins_today,
+      consec_loss,
+      CountPositions(),
+      GetSpread(),
+      AccountInfoDouble(ACCOUNT_BALANCE)
+   );
+   
+   Comment(info);
+}
+
+//==================================================================
+// RISK MANAGEMENT
+//==================================================================
+void CheckDailyReset()
+{
+   datetime now = TimeCurrent();
+   MqlDateTime dt_now, dt_reset;
+   TimeToStruct(now, dt_now);
+   TimeToStruct(daily_reset, dt_reset);
+   
+   if(dt_now.day != dt_reset.day || dt_now.mon != dt_reset.mon)
+   {
+      PrintFormat("📅 DAY END: %d trades | %.1f%% WR | %.2f%%", 
+                  trades_today, 
+                  (trades_today > 0) ? (wins_today * 100.0 / trades_today) : 0,
+                  daily_pct);
+      
+      daily_start_bal = AccountInfoDouble(ACCOUNT_BALANCE);
+      daily_pl = 0;
+      daily_pct = 0;
+      trades_today = 0;
+      wins_today = 0;
+      consec_loss = 0;
+      daily_reset = now;
+      trading_on = true;
+   }
+   
+   if(daily_start_bal > 0)
+      daily_pct = (daily_pl / daily_start_bal) * 100.0;
+}
+
+bool CheckRiskLimits()
+{
+   if(Max_Daily_Loss > 0 && daily_pct <= -Max_Daily_Loss)
+   {
+      PrintFormat("⛔ HALT: Daily loss %.2f%% >= %.2f%%", -daily_pct, Max_Daily_Loss);
+      trading_on = false;
+      return false;
+   }
+   
+   if(Max_Consecutive_Loss > 0 && consec_loss >= Max_Consecutive_Loss)
+   {
+      PrintFormat("⛔ HALT: Consecutive losses %d >= %d", consec_loss, Max_Consecutive_Loss);
+      trading_on = false;
+      return false;
+   }
+   
+   return true;
+}
+
+//==================================================================
+// ONTRADE TRANSACTION
+//==================================================================
+void OnTradeTransaction(const MqlTradeTransaction& trans,
+                        const MqlTradeRequest& request,
+                        const MqlTradeResult& result)
+{
+   if(trans.type == TRADE_TRANSACTION_DEAL_ADD)
+   {
+      ulong deal = trans.deal;
+      if(!HistoryDealSelect(deal)) return;
+      
+      if(HistoryDealGetInteger(deal, DEAL_MAGIC) != Magic) return;
+      if(HistoryDealGetString(deal, DEAL_SYMBOL) != _Symbol) return;
+      
+      ENUM_DEAL_ENTRY entry = (ENUM_DEAL_ENTRY)HistoryDealGetInteger(deal, DEAL_ENTRY);
+      
+      if(entry == DEAL_ENTRY_OUT)
+      {
+         double profit = HistoryDealGetDouble(deal, DEAL_PROFIT);
+         double swap = HistoryDealGetDouble(deal, DEAL_SWAP);
+         double comm = HistoryDealGetDouble(deal, DEAL_COMMISSION);
+         double total = profit + swap + comm;
+         
+         daily_pl += total;
+         
+         if(total > 0)
+         {
+            wins_today++;
+            consec_loss = 0;
+         }
+         else
+         {
+            consec_loss++;
+         }
+         
+         if(Verbose)
+            PrintFormat("📊 Trade closed: %.2f | Daily: %.2f%% | WR: %.1f%%",
+                        total, daily_pct,
+                        (trades_today > 0) ? (wins_today * 100.0 / trades_today) : 0);
+      }
+   }
+}
+
+//==================================================================
+// DATA UPDATE
+//==================================================================
+bool IsNewBar()
+{
+   datetime current = iTime(_Symbol, PERIOD_M1, 0);
+   if(current != last_bar)
+   {
+      last_bar = current;
+      return true;
+   }
+   return false;
+}
+
+bool UpdateData()
+{
+   int bars = 100;
+   if(CopyClose(_Symbol, PERIOD_M1, 0, bars, c) <= 0) return false;
+   if(CopyOpen(_Symbol, PERIOD_M1, 0, bars, o) <= 0) return false;
+   if(CopyHigh(_Symbol, PERIOD_M1, 0, bars, h) <= 0) return false;
+   if(CopyLow(_Symbol, PERIOD_M1, 0, bars, l) <= 0) return false;
+   if(CopyTickVolume(_Symbol, PERIOD_M1, 0, bars, vol) <= 0) return false;
+   if(CopyBuffer(h_atr, 0, 0, bars, atr) <= 0) return false;
+   
+   if(Use_EMA)
+   {
+      if(CopyBuffer(h_ema_f, 0, 0, bars, ema_f) <= 0) return false;
+      if(CopyBuffer(h_ema_s, 0, 0, bars, ema_s) <= 0) return false;
+   }
+   
+   if(Use_RSI)
+   {
+      if(CopyBuffer(h_rsi, 0, 0, bars, rsi) <= 0) return false;
+   }
+   
+   return true;
+}
+
+//==================================================================
+// STEP 1: KILL ZONE
+//==================================================================
+bool InKillZone()
+{
+   MqlDateTime dt;
+   TimeToStruct(TimeGMT(), dt);
+   
+   if(Use_London_KZ && dt.hour >= London_Start && dt.hour < London_End)
+      return true;
+   
+   if(Use_NY_KZ && dt.hour >= NY_Start && dt.hour < NY_End)
+      return true;
+   
+   return false;
+}
+
+//==================================================================
+// STEP 3: STRUCTURE
+//==================================================================
+void DetectStructure()
+{
+   int lb = MathMin(Structure_Lookback, ArraySize(h) - Structure_Bars - 1);
+   ArrayResize(sw_h, 0);
+   ArrayResize(sw_l, 0);
+   
+   for(int i = Structure_Bars; i < lb; i++)
+   {
+      bool is_high = true, is_low = true;
+      
+      for(int j = 1; j <= Structure_Bars; j++)
+      {
+         if(h[i] <= h[i-j] || h[i] <= h[i+j]) is_high = false;
+         if(l[i] >= l[i-j] || l[i] >= l[i+j]) is_low = false;
+      }
+      
+      if(is_high)
+      {
+         SwingPoint sp;
+         sp.price = h[i];
+         sp.idx = i;
+         sp.is_high = true;
+         int sz = ArraySize(sw_h);
+         ArrayResize(sw_h, sz + 1);
+         sw_h[sz] = sp;
+      }
+      
+      if(is_low)
+      {
+         SwingPoint sp;
+         sp.price = l[i];
+         sp.idx = i;
+         sp.is_high = false;
+         int sz = ArraySize(sw_l);
+         ArrayResize(sw_l, sz + 1);
+         sw_l[sz] = sp;
+      }
+   }
+   
+   bias = BIAS_NEUTRAL;
+   int hs = ArraySize(sw_h), ls = ArraySize(sw_l);
+   
+   if(hs >= 2 && ls >= 2)
+   {
+      bool hh = sw_h[0].price > sw_h[1].price;
+      bool hl = sw_l[0].price > sw_l[1].price;
+      bool lh = sw_h[0].price < sw_h[1].price;
+      bool ll = sw_l[0].price < sw_l[1].price;
+      
+      if(hh && hl) bias = BIAS_BULLISH;
+      else if(lh && ll) bias = BIAS_BEARISH;
+   }
+}
+
+//==================================================================
+// STEP 4: LIQUIDITY
+//==================================================================
+void DetectLiquidity()
+{
+   ArrayResize(liq_pools, 0);
+   int lb = MathMin(50, ArraySize(h) - 1);
+   
+   for(int i = 1; i < lb - 5; i++)
+   {
+      int touches = 1;
+      for(int j = i + 1; j < MathMin(i + 15, lb); j++)
+      {
+         if(MathAbs(h[j] - h[i]) <= EQ_Tolerance * _Point)
+            touches++;
+      }
+      
+      if(touches >= Min_Pool_Touches)
+      {
+         LiqPool pool;
+         pool.price = h[i];
+         pool.is_buy = true;
+         pool.taken = false;
+         pool.touches = touches;
+         int sz = ArraySize(liq_pools);
+         ArrayResize(liq_pools, sz + 1);
+         liq_pools[sz] = pool;
+      }
+   }
+   
+   for(int i = 1; i < lb - 5; i++)
+   {
+      int touches = 1;
+      for(int j = i + 1; j < MathMin(i + 15, lb); j++)
+      {
+         if(MathAbs(l[j] - l[i]) <= EQ_Tolerance * _Point)
+            touches++;
+      }
+      
+      if(touches >= Min_Pool_Touches)
+      {
+         LiqPool pool;
+         pool.price = l[i];
+         pool.is_buy = false;
+         pool.taken = false;
+         pool.touches = touches;
+         int sz = ArraySize(liq_pools);
+         ArrayResize(liq_pools, sz + 1);
+         liq_pools[sz] = pool;
+      }
+   }
+}
+
+LIQUIDITY_TYPE CheckSweep()
+{
+   int sz = ArraySize(liq_pools);
+   for(int i = 0; i < sz; i++)
+   {
+      if(liq_pools[i].taken) continue;
+      
+      if(liq_pools[i].is_buy)
+      {
+         if(h[1] > liq_pools[i].price && c[1] < liq_pools[i].price)
+         {
+            double wick = h[1] - MathMax(o[1], c[1]);
+            double range = h[1] - l[1];
+            if(range > 0 && wick / range >= Sweep_Wick_Ratio)
+            {
+               liq_pools[i].taken = true;
+               return LIQ_BUYSIDE;
+            }
+         }
+      }
+      else
+      {
+         if(l[1] < liq_pools[i].price && c[1] > liq_pools[i].price)
+         {
+            double wick = MathMin(o[1], c[1]) - l[1];
+            double range = h[1] - l[1];
+            if(range > 0 && wick / range >= Sweep_Wick_Ratio)
+            {
+               liq_pools[i].taken = true;
+               return LIQ_SELLSIDE;
+            }
+         }
+      }
+   }
+   
+   return LIQ_NONE;
+}
+
+//==================================================================
+// STEP 5: DISPLACEMENT
+//==================================================================
+bool CheckDisplacement(LIQUIDITY_TYPE liq)
+{
+   double body = MathAbs(c[0] - o[0]);
+   double range = h[0] - l[0];
+   
+   if(range <= 0) return false;
+   
+   bool strong = body / range >= 0.65;
+   bool directional = false;
+   
+   if(liq == LIQ_BUYSIDE && c[0] < o[0]) directional = true;
+   else if(liq == LIQ_SELLSIDE && c[0] > o[0]) directional = true;
+   
+   return (strong && directional);
+}
+
+//==================================================================
+// STEP 6: PREMIUM/DISCOUNT
+//==================================================================
+void UpdateRange()
+{
+   int hs = ArraySize(sw_h), ls = ArraySize(sw_l);
+   
+   if(hs > 0 && ls > 0)
+   {
+      range_h = sw_h[0].price;
+      range_l = sw_l[0].price;
+      range_eq = (range_h + range_l) / 2.0;
+   }
+}
+
+int CheckPremDisc(LIQUIDITY_TYPE liq)
+{
+   if(range_h <= range_l) return 0;
+   
+   double pct = (c[0] - range_l) / (range_h - range_l);
+   
+   if(liq == LIQ_BUYSIDE && pct >= Premium_Level)
+      return -1;  // SELL in premium
+   
+   if(liq == LIQ_SELLSIDE && pct <= Discount_Level)
+      return 1;   // BUY in discount
+   
+   return 0;
+}
+
+//==================================================================
+// STEP 7: FVG
+//==================================================================
+void DetectFVG()
+{
+   ArrayResize(fvgs, 0);
+   
+   for(int i = 2; i < 20; i++)
+   {
+      if(l[i-1] > h[i+1])
+      {
+         FVG f;
+         f.top = l[i-1];
+         f.bot = h[i+1];
+         f.bullish = true;
+         f.hit = false;
+         f.idx = i;
+         
+         if(f.top - f.bot >= atr[i] * Min_FVG_ATR)
+         {
+            int sz = ArraySize(fvgs);
+            ArrayResize(fvgs, sz + 1);
+            fvgs[sz] = f;
+         }
+      }
+      
+      if(h[i-1] < l[i+1])
+      {
+         FVG f;
+         f.top = l[i+1];
+         f.bot = h[i-1];
+         f.bullish = false;
+         f.hit = false;
+         f.idx = i;
+         
+         if(f.top - f.bot >= atr[i] * Min_FVG_ATR)
+         {
+            int sz = ArraySize(fvgs);
+            ArrayResize(fvgs, sz + 1);
+            fvgs[sz] = f;
+         }
+      }
+   }
+}
+
+bool CheckFVGEntry(int signal)
+{
+   int sz = ArraySize(fvgs);
+   for(int i = 0; i < sz; i++)
+   {
+      if(fvgs[i].hit) continue;
+      
+      if(signal == 1 && fvgs[i].bullish)
+      {
+         if(l[0] <= fvgs[i].top && h[0] >= fvgs[i].bot)
+         {
+            fvgs[i].hit = true;
+            return true;
+         }
+      }
+      else if(signal == -1 && !fvgs[i].bullish)
+      {
+         if(h[0] >= fvgs[i].bot && l[0] <= fvgs[i].top)
+         {
+            fvgs[i].hit = true;
+            return true;
+         }
+      }
+   }
+   
+   return false;
+}
+
+//==================================================================
+// ORDER BLOCKS
+//==================================================================
+void DetectOB()
+{
+   ArrayResize(obs, 0);
+   
+   for(int i = 1; i < 20; i++)
+   {
+      if(c[i] < o[i] && c[i-1] > o[i-1])
+      {
+         double body = MathAbs(c[i] - o[i]);
+         double range = h[i] - l[i];
+         
+         if(range > 0 && body / range >= OB_Body_Ratio)
+         {
+            OB ob;
+            ob.h = h[i];
+            ob.l = l[i];
+            ob.bullish = true;
+            ob.hit = false;
+            ob.idx = i;
+            
+            int sz = ArraySize(obs);
+            ArrayResize(obs, sz + 1);
+            obs[sz] = ob;
+         }
+      }
+      
+      if(c[i] > o[i] && c[i-1] < o[i-1])
+      {
+         double body = MathAbs(c[i] - o[i]);
+         double range = h[i] - l[i];
+         
+         if(range > 0 && body / range >= OB_Body_Ratio)
+         {
+            OB ob;
+            ob.h = h[i];
+            ob.l = l[i];
+            ob.bullish = false;
+            ob.hit = false;
+            ob.idx = i;
+            
+            int sz = ArraySize(obs);
+            ArrayResize(obs, sz + 1);
+            obs[sz] = ob;
+         }
+      }
+   }
+}
+
+bool CheckOBEntry(int signal)
+{
+   int sz = ArraySize(obs);
+   for(int i = 0; i < sz; i++)
+   {
+      if(obs[i].hit) continue;
+      
+      if(signal == 1 && obs[i].bullish)
+      {
+         if(l[0] <= obs[i].h && h[0] >= obs[i].l)
+         {
+            obs[i].hit = true;
+            return true;
+         }
+      }
+      else if(signal == -1 && !obs[i].bullish)
+      {
+         if(h[0] >= obs[i].l && l[0] <= obs[i].h)
+         {
+            obs[i].hit = true;
+            return true;
+         }
+      }
+   }
+   
+   return false;
+}
+
+//==================================================================
+// STEP 8: INDICATOR CONFIRMATION
+//==================================================================
+bool ConfirmIndicators(int signal)
+{
+   if(Use_EMA)
+   {
+      if(signal == 1 && ema_f[0] <= ema_s[0]) return false;
+      if(signal == -1 && ema_f[0] >= ema_s[0]) return false;
+   }
+   
+   if(Use_RSI)
+   {
+      if(signal == 1 && rsi[0] < RSI_Lower) return false;
+      if(signal == -1 && rsi[0] > RSI_Upper) return false;
+   }
+   
+   if(Use_Volume)
+   {
+      long avg = 0;
+      int count = 0;
+      for(int i = 2; i < 12 && i < ArraySize(vol); i++)
+      {
+         avg += vol[i];
+         count++;
+      }
+      if(count > 0) avg /= count;
+      
+      if(avg > 0 && vol[1] < avg * Vol_Mult)
+         return false;
+   }
+   
+   return true;
+}
+
+//==================================================================
+// STEP 10: EXECUTE TRADE
+//==================================================================
+bool ExecuteTrade(int signal, LIQUIDITY_TYPE liq, string reason)
+{
+   double lot = CalcLot();
+   if(lot <= 0 || lot > Max_Lot_Size)
+   {
+      Print("❌ Invalid lot size");
+      return false;
+   }
+   
+   double price, sl, tp;
+   ENUM_ORDER_TYPE type;
+   
+   if(signal == 1)
+   {
+      type = ORDER_TYPE_BUY;
+      price = SymbolInfoDouble(_Symbol, SYMBOL_ASK);
+      sl = NormalizeDouble(price - SL_ATR * atr[0], _Digits);
+      tp = NormalizeDouble(price + TP_ATR * atr[0], _Digits);
+   }
+   else
+   {
+      type = ORDER_TYPE_SELL;
+      price = SymbolInfoDouble(_Symbol, SYMBOL_BID);
+      sl = NormalizeDouble(price + SL_ATR * atr[0], _Digits);
+      tp = NormalizeDouble(price - TP_ATR * atr[0], _Digits);
+   }
+   
+   MqlTradeRequest req;
+   MqlTradeResult res;
+   ZeroMemory(req);
+   ZeroMemory(res);
+   
+   req.action = TRADE_ACTION_DEAL;
+   req.symbol = _Symbol;
+   req.volume = lot;
+   req.type = type;
+   req.price = price;
+   req.sl = sl;
+   req.tp = tp;
+   req.magic = Magic;
+   req.deviation = Max_Slippage;
+   req.comment = StringFormat("ICT_%s_%s", LiqStr(liq), reason);
+   req.type_filling = GetFillingMode();
+   
+   if(OrderSend(req, res) && res.retcode == TRADE_RETCODE_DONE)
+   {
+      trades_today++;
+      PrintFormat("✅ %s @ %.5f | SL: %.5f | TP: %.5f | %s", 
+                  EnumToString(type), res.price, sl, tp, req.comment);
+      return true;
+   }
+   else
+   {
+      PrintFormat("❌ FAILED: %d - %s", res.retcode, res.comment);
+      return false;
+   }
+}
+
+//==================================================================
+// LOT CALCULATION
+//==================================================================
+double CalcLot()
+{
+   double bal = AccountInfoDouble(ACCOUNT_BALANCE);
+   double risk_amt = bal * (Risk_Per_Trade / 100.0);
+   
+   double tick_val = SymbolInfoDouble(_Symbol, SYMBOL_TRADE_TICK_VALUE);
+   double tick_sz = SymbolInfoDouble(_Symbol, SYMBOL_TRADE_TICK_SIZE);
+   double point = _Point;
+   
+   double sl_dist = SL_ATR * atr[0];
+   double sl_points = sl_dist / point;
+   
+   double lot = 0;
+   if(tick_sz > 0 && sl_points > 0)
+   {
+      lot = risk_amt / (sl_points * tick_val / tick_sz);
+   }
+   
+   double min_lot = SymbolInfoDouble(_Symbol, SYMBOL_VOLUME_MIN);
+   double max_lot = SymbolInfoDouble(_Symbol, SYMBOL_VOLUME_MAX);
+   double step = SymbolInfoDouble(_Symbol, SYMBOL_VOLUME_STEP);
+   
+   if(lot < min_lot) lot = min_lot;
+   if(lot > max_lot) lot = max_lot;
+   if(step > 0) lot = MathFloor(lot / step) * step;
+   
+   return NormalizeDouble(lot, 2);
+}
+
+//==================================================================
+// UTILITIES
+//==================================================================
+ENUM_ORDER_TYPE_FILLING GetFillingMode()
+{
+   int filling = (int)SymbolInfoInteger(_Symbol, SYMBOL_FILLING_MODE);
+   
+   if((filling & SYMBOL_FILLING_IOC) == SYMBOL_FILLING_IOC)
+      return ORDER_FILLING_IOC;
+   else if((filling & SYMBOL_FILLING_FOK) == SYMBOL_FILLING_FOK)
+      return ORDER_FILLING_FOK;
+   
+   return ORDER_FILLING_RETURN;
+}
+
+double GetSpread()
+{
+   long spread = SymbolInfoInteger(_Symbol, SYMBOL_SPREAD);
+   return (double)spread;
+}
+
+bool HasPosition()
+{
+   for(int i = 0; i < PositionsTotal(); i++)
+   {
+      if(PositionGetSymbol(i) != _Symbol) continue;
+      if(PositionGetInteger(POSITION_MAGIC) == Magic)
+         return true;
+   }
+   return false;
+}
+
+int CountPositions()
+{
+   int count = 0;
+   for(int i = 0; i < PositionsTotal(); i++)
+   {
+      if(PositionGetSymbol(i) != _Symbol) continue;
+      if(PositionGetInteger(POSITION_MAGIC) == Magic)
+         count++;
+   }
+   return count;
+}
+
+string BiasStr()
+{
+   if(bias == BIAS_BULLISH) return "BULLISH";
+   if(bias == BIAS_BEARISH) return "BEARISH";
+   return "NEUTRAL";
+}
+
+string LiqStr(LIQUIDITY_TYPE liq)
+{
+   if(liq == LIQ_BUYSIDE) return "BUYSIDE";
+   if(liq == LIQ_SELLSIDE) return "SELLSIDE";
+   return "NONE";
+}
+
+//+------------------------------------------------------------------+
+//| END OF AURIC EDGE ICT-SMC HYBRID EA v4.0                         |
+//+------------------------------------------------------------------+
+//
+// EXECUTION HIERARCHY (MANDATORY ORDER):
+// 1. ICT Kill Zone Check (Time Filter)
+// 2. Market Structure Detection (Bias)
+// 3. Liquidity Sweep Detection (Entry Trigger)
+// 4. Displacement Confirmation
+// 5. Premium/Discount Zone Check
+// 6. FVG/OB Mitigation (Entry Location)
+// 7. Indicator Confirmation (Secondary)
+// 8. Risk Filters
+// 9. Execute Trade
+//
+// CRITICAL RULES:
+// - Liquidity sweep MUST occur before trade
+// - Structure determines bias only
+// - Indicators CANNOT override context
+// - One trade per liquidity event
+// - SL beyond liquidity extreme
+// - TP at opposing liquidity
+//
+// TESTING RECOMMENDATIONS:
+// 1. Test on DEMO first
+// 2. Verify structure detection manually
+// 3. Check liquidity pool identification
+// 4. Confirm kill zone times match your broker GMT offset
+// 5. Monitor spread during your sessions
+// 6. Start with 0.5% risk
+//
+// OPTIMIZATION NOTES:
+// - Structure_Bars: Lower = more swings, Higher = cleaner structure
+// - EQ_Tolerance: Adjust based on symbol volatility
+// - Min_FVG_ATR: Larger = fewer but higher quality FVGs
+// - Premium/Discount: 0.62/0.38 is ICT standard
+//
+//+------------------------------------------------------------------+
