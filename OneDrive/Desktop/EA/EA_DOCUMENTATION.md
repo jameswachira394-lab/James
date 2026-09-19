@@ -62,7 +62,7 @@ Enhanced professional scalping system optimized for gold, indices, forex, and vo
 
 ### Summary
 
-Institutional liquidity-based execution engine combining ICT (Inner Circle Trader) smart money concepts with SMC (Supply/Demand) price action. Focuses on liquidity sweeps and institutional dealing ranges.
+Institutional liquidity-based execution engine combining ICT (Inner Circle Trader) smart money concepts with SMC (Supply/Demand) price action. Focuses on liquidity sweeps and institutional dealing ranges.bxbdhdh
 
 ### Core Methodology
 
