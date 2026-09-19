@@ -1,4 +1,4 @@
-rbxhxhdhddbhdhdhduxhdhhdhdbxbxhxhdh# Expert Advisors Documentation
+bxbdhdhdhrbxhxhdhddbhdhdhduxhdhhdhdbxbxhxhdh# Expert Advisors Documentation
 
 ## Overview
 
